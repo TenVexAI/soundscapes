@@ -6,6 +6,7 @@
   --color-accent-purple: #a287f4;
   --color-accent-cyan: #12e6c8;
   --color-accent-green: #3cf281;
+  --color-accent-red: #e44c55;
   --color-text-primary: #e0e0e0;
   --color-text-secondary: #a0a0a0;
   --color-border: #2a5a5e;
@@ -83,6 +84,12 @@ input[type="range"]::-webkit-slider-runnable-track {
   width: 100%;
   height: 8px;
   background: transparent;
+}
+
+/* Vertical slider thumb - center on track */
+.vertical-slider::-webkit-slider-thumb {
+  margin-top: 0;
+  margin-left: 4px;
 }
 
 input[type="range"]:focus {

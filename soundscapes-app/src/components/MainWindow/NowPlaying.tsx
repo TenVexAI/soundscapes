@@ -11,12 +11,6 @@ interface MusicProgress {
   is_finished: boolean;
 }
 
-const formatTime = (seconds: number): string => {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-};
-
 export const NowPlaying: React.FC = () => {
   const { currentTrack, isPlaying, togglePlayPause, playNext, playPrevious } = usePlaylistStore();
   const { isMusicMuted } = useAudioStore();
@@ -46,77 +40,76 @@ export const NowPlaying: React.FC = () => {
     : 0;
 
   return (
-    <div className={`p-5 bg-bg-secondary/50 rounded-2xl border border-border backdrop-blur-sm ${isMusicMuted ? 'opacity-50' : ''}`}>
-      <div className="flex items-center gap-5">
-        <div className="w-16 h-16 bg-bg-secondary rounded-xl flex items-center justify-center shadow-lg">
-          <Music size={32} className="text-accent-purple" />
+    <div className={`relative overflow-hidden rounded-xl bg-gradient-to-r from-bg-secondary/80 to-bg-secondary/40 border border-border/50 backdrop-blur-md ${isMusicMuted ? 'opacity-50' : ''}`}>
+      {/* Subtle glow effect */}
+      <div className="absolute inset-0 bg-gradient-to-r from-accent-purple/5 to-accent-cyan/5 pointer-events-none" />
+      
+      <div className="relative flex items-center gap-4" style={{ padding: '12px' }}>
+        {/* Album art placeholder */}
+        <div className="w-12 h-12 bg-gradient-to-br from-accent-purple/20 to-accent-cyan/20 rounded-lg flex items-center justify-center flex-shrink-0">
+          <Music size={24} className="text-accent-purple" />
         </div>
         
+        {/* Track info */}
         <div className="flex-1 min-w-0">
           {currentTrack ? (
             <>
-              <h3 className="text-lg font-semibold text-text-primary truncate">
+              <h3 className="text-sm font-semibold text-text-primary truncate">
                 {currentTrack.title}
               </h3>
-              <p className="text-sm text-text-secondary truncate">
+              <p className="text-xs text-text-secondary truncate">
                 {currentTrack.artist} • {currentTrack.album}
               </p>
-              
-              <div className="mt-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-text-secondary w-10">
-                    {formatTime(progress.currentTime)}
-                  </span>
-                  <div className="flex-1 h-1.5 bg-bg-secondary rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-accent-purple rounded-full transition-all duration-100"
-                      style={{ width: `${progressPercent}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-text-secondary w-10 text-right">
-                    {formatTime(progress.duration)}
-                  </span>
-                </div>
-              </div>
             </>
           ) : (
             <>
-              <h3 className="text-lg font-semibold text-text-secondary">
+              <h3 className="text-sm font-medium text-text-secondary">
                 No track playing
               </h3>
-              <p className="text-sm text-text-secondary">
+              <p className="text-xs text-text-secondary/70">
                 Select a track to play
               </p>
             </>
           )}
         </div>
         
-        <div className="flex items-center gap-2">
+        {/* Playback controls */}
+        <div className="flex items-center gap-1">
           <button
             onClick={playPrevious}
-            className="p-2.5 rounded-xl text-text-secondary hover:text-text-primary hover:bg-bg-secondary transition-colors"
+            className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/5 transition-all"
             title="Previous"
           >
-            <SkipBack size={24} />
+            <SkipBack size={18} />
           </button>
           
           <button
             onClick={togglePlayPause}
-            className="p-3.5 rounded-full bg-accent-purple text-bg-primary hover:bg-accent-purple/80 transition-colors shadow-lg"
+            className="p-2.5 rounded-full bg-gradient-to-r from-accent-purple to-accent-cyan text-bg-primary hover:opacity-90 transition-all shadow-lg shadow-accent-purple/20"
             title={isPlaying ? 'Pause' : 'Play'}
           >
-            {isPlaying ? <Pause size={24} /> : <Play size={24} />}
+            {isPlaying ? <Pause size={20} /> : <Play size={20} className="ml-0.5" />}
           </button>
           
           <button
             onClick={playNext}
-            className="p-2.5 rounded-xl text-text-secondary hover:text-text-primary hover:bg-bg-secondary transition-colors"
+            className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/5 transition-all"
             title="Next"
           >
-            <SkipForward size={24} />
+            <SkipForward size={18} />
           </button>
         </div>
       </div>
+      
+      {/* Progress bar at bottom */}
+      {currentTrack && (
+        <div className="h-1 bg-bg-primary/50">
+          <div 
+            className="h-full bg-gradient-to-r from-accent-purple to-accent-cyan transition-all duration-100"
+            style={{ width: `${progressPercent}%` }}
+          />
+        </div>
+      )}
     </div>
   );
 };

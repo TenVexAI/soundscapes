@@ -6,12 +6,12 @@ export const Soundboard: React.FC = () => {
   const { sounds, currentlyPlaying, playSound, updateSoundVolume } = useSoundboardStore();
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center justify-between p-4 border-b border-border">
+    <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
+      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
         <h2 className="text-lg font-semibold text-text-primary">Soundboard</h2>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto" style={{ paddingRight: '4px' }}>
         {sounds.length > 0 ? (
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             {sounds.map((sound) => (

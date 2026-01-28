@@ -67,7 +67,7 @@ export const useWindowStore = create<WindowState>((set, get) => ({
     try {
       const window = await WebviewWindow.getByLabel(type);
       if (window) {
-        await window.destroy();
+        await window.close();
       }
     } catch (e) {
       console.error(`Failed to close ${type} window:`, e);

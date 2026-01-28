@@ -25,7 +25,7 @@ const SidebarButton: React.FC<SidebarButtonProps> = ({
   // Color logic: white when closed, cyan when open, red on hover when open (to close)
   let colorClass = 'text-text-secondary hover:text-text-primary'; // closed
   if (isOpen) {
-    colorClass = isHovered ? 'text-red-400' : 'text-accent-cyan';
+    colorClass = isHovered ? 'text-accent-red' : 'text-accent-cyan';
   }
   
   return (
@@ -51,20 +51,29 @@ const ExitDialog: React.FC<ExitDialogProps> = ({ isOpen, onConfirm, onCancel }) 
   if (!isOpen) return null;
   
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-      <div className="bg-bg-secondary rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl border border-border">
-        <h3 className="text-lg font-semibold text-text-primary mb-2">Exit Soundscapes?</h3>
-        <p className="text-text-secondary mb-6">Are you sure you want to close the application?</p>
-        <div className="flex gap-3">
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
+      <div 
+        className="bg-bg-primary rounded-xl border border-border/50 shadow-2xl"
+        style={{ padding: '24px', minWidth: '320px', maxWidth: '400px' }}
+      >
+        <h3 className="text-xl font-semibold text-text-primary" style={{ marginBottom: '8px' }}>
+          Exit Soundscapes?
+        </h3>
+        <p className="text-text-secondary text-sm" style={{ marginBottom: '24px' }}>
+          Are you sure you want to close the application?
+        </p>
+        <div style={{ display: 'flex', gap: '12px' }}>
           <button
             onClick={onCancel}
-            className="flex-1 px-4 py-2.5 rounded-lg bg-bg-primary text-text-secondary hover:text-text-primary transition-colors"
+            className="flex-1 rounded-lg bg-bg-secondary text-text-secondary hover:text-text-primary hover:bg-bg-secondary/80 transition-all"
+            style={{ padding: '12px 16px', fontWeight: 500 }}
           >
             Cancel
           </button>
           <button
             onClick={onConfirm}
-            className="flex-1 px-4 py-2.5 rounded-lg bg-red-500 text-white hover:bg-red-600 transition-colors"
+            className="flex-1 rounded-lg bg-accent-red text-white hover:opacity-90 transition-all"
+            style={{ padding: '12px 16px', fontWeight: 500 }}
           >
             Exit
           </button>
@@ -96,8 +105,8 @@ export const Sidebar: React.FC = () => {
 
   return (
     <>
-      <div className="w-14 bg-bg-primary border-r border-border flex flex-col items-center py-4">
-        <div className="flex-1 flex flex-col gap-2">
+      <div className="w-14 bg-bg-primary border-r border-border flex flex-col items-center" style={{ paddingTop: '8px', paddingBottom: '8px' }}>
+        <div className="flex-1 flex flex-col gap-2" style={{ paddingTop: '8px' }}>
           {buttons.map(({ type, icon, title }) => (
             <SidebarButton
               key={type}
@@ -112,11 +121,11 @@ export const Sidebar: React.FC = () => {
           ))}
         </div>
         
-        <div className="mt-auto">
+        <div style={{ paddingBottom: '8px' }}>
           <button
             onClick={() => setShowExitDialog(true)}
             title="Exit"
-            className="w-10 h-10 flex items-center justify-center rounded-lg text-red-400/70 hover:text-red-400 transition-all duration-200"
+            className="w-10 h-10 flex items-center justify-center rounded-lg text-accent-red/70 hover:text-accent-red transition-all duration-200"
           >
             <Power size={22} />
           </button>

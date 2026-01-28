@@ -88,8 +88,8 @@ export const MusicPlaylist: React.FC = () => {
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center justify-between p-4 border-b border-border">
+    <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
+      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
         <h2 className="text-lg font-semibold text-text-primary">Music Library</h2>
         <button
           onClick={toggleShuffle}
@@ -102,7 +102,7 @@ export const MusicPlaylist: React.FC = () => {
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-2">
+      <div className="flex-1 overflow-y-auto" style={{ paddingRight: '4px' }}>
         {albums.map((album) => (
           <div key={album.name} className="mb-2">
             <button
@@ -156,7 +156,7 @@ export const MusicPlaylist: React.FC = () => {
             <h3 className="text-sm font-medium text-text-secondary">Queue ({queue.length})</h3>
             <button
               onClick={clearQueue}
-              className="text-xs text-text-secondary hover:text-red-400 transition-colors"
+              className="text-xs text-text-secondary hover:text-accent-red transition-colors"
             >
               Clear
             </button>
@@ -173,7 +173,7 @@ export const MusicPlaylist: React.FC = () => {
                 </div>
                 <button
                   onClick={() => removeFromQueue(index)}
-                  className="p-1 text-text-secondary hover:text-red-400"
+                  className="p-1 text-text-secondary hover:text-accent-red"
                 >
                   <X size={14} />
                 </button>

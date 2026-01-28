@@ -325,7 +325,7 @@ export const AmbientSoundscapes: React.FC = () => {
           </button>
           <button
             onClick={clearAll}
-            className="p-2 rounded-lg text-text-secondary hover:text-red-400 hover:bg-bg-secondary transition-colors"
+            className="p-2 rounded-lg text-text-secondary hover:text-accent-red hover:bg-bg-secondary transition-colors"
             title="Clear all"
           >
             <Trash2 size={20} />
@@ -368,7 +368,7 @@ export const AmbientSoundscapes: React.FC = () => {
                     </button>
                     <button
                       onClick={() => deselectAllInCategory(category.name)}
-                      className="text-xs px-2 py-1 rounded bg-bg-secondary text-text-secondary hover:text-red-400 transition-colors"
+                      className="text-xs px-2 py-1 rounded bg-bg-secondary text-text-secondary hover:text-accent-red transition-colors"
                     >
                       Select None
                     </button>

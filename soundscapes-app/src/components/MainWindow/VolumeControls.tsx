@@ -2,7 +2,7 @@ import React from 'react';
 import { Volume2, VolumeX, Music, Waves, Grid3X3 } from 'lucide-react';
 import { useAudioStore } from '../../stores/audioStore';
 
-interface VolumeSliderProps {
+interface VerticalVolumeSliderProps {
   label: string;
   icon: React.ReactNode;
   value: number;
@@ -12,7 +12,7 @@ interface VolumeSliderProps {
   color: string;
 }
 
-const VolumeSlider: React.FC<VolumeSliderProps> = ({
+const VerticalVolumeSlider: React.FC<VerticalVolumeSliderProps> = ({
   label,
   icon,
   value,
@@ -21,30 +21,62 @@ const VolumeSlider: React.FC<VolumeSliderProps> = ({
   onToggleMute,
   color,
 }) => (
-  <div className="flex items-center gap-4 p-3 rounded-xl bg-bg-secondary/30 hover:bg-bg-secondary/50 transition-colors">
+  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%' }}>
+    {/* Icon/mute button at top */}
     <button
       onClick={onToggleMute}
-      className={`p-2 rounded-lg transition-colors ${
-        isMuted ? 'text-red-400 bg-red-400/10' : 'text-text-primary'
-      } hover:bg-bg-secondary`}
+      className={`p-1.5 rounded-lg transition-all ${
+        isMuted ? 'text-accent-red' : 'text-text-secondary hover:text-text-primary'
+      }`}
       title={`${isMuted ? 'Unmute' : 'Mute'} ${label}`}
     >
-      {isMuted ? <VolumeX size={22} /> : icon}
+      {isMuted ? <VolumeX size={18} /> : icon}
     </button>
-    <div className="flex-1">
-      <div className="flex justify-between text-sm mb-2">
-        <span className="text-text-secondary font-medium">{label}</span>
-        <span className="text-text-primary font-semibold">{Math.round(value)}%</span>
-      </div>
+    
+    {/* Vertical slider - fills remaining height */}
+    <div style={{ position: 'relative', width: '24px', flex: 1, marginTop: '8px', marginBottom: '8px' }}>
+      {/* Track background - centered horizontally */}
+      <div style={{ 
+        position: 'absolute', 
+        left: '50%', 
+        transform: 'translateX(-50%)',
+        top: 0, 
+        bottom: 0, 
+        width: '8px', 
+        borderRadius: '4px', 
+        backgroundColor: '#1a1a1a' 
+      }} />
+      {/* Filled track (from bottom) - centered horizontally */}
+      <div style={{ 
+        position: 'absolute', 
+        left: '50%', 
+        transform: 'translateX(-50%)',
+        bottom: 0, 
+        width: '8px', 
+        height: `${value}%`, 
+        borderRadius: '4px', 
+        backgroundColor: color, 
+        opacity: isMuted ? 0.3 : 1, 
+        transition: 'opacity 0.2s, height 0.1s' 
+      }} />
+      {/* Vertical input - use orient attribute for Firefox, writing-mode for others */}
       <input
         type="range"
         min="0"
         max="100"
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full h-2 rounded-lg appearance-none cursor-pointer"
-        style={{
-          background: `linear-gradient(to right, ${color} 0%, ${color} ${value}%, #313131 ${value}%, #313131 100%)`,
+        className="vertical-slider"
+        style={{ 
+          position: 'absolute',
+          width: '24px',
+          height: '100%',
+          left: 0,
+          top: 0,
+          writingMode: 'vertical-lr',
+          direction: 'rtl',
+          background: 'transparent', 
+          cursor: 'pointer' 
         }}
       />
     </div>
@@ -72,49 +104,42 @@ export const VolumeControls: React.FC = () => {
   } = useAudioStore();
 
   return (
-    <div className="space-y-3 p-5 bg-bg-secondary/50 rounded-2xl border border-border backdrop-blur-sm">
-      <h3 className="text-xs font-semibold text-text-secondary uppercase tracking-widest mb-4">
-        Volume Controls
-      </h3>
-      
-      <VolumeSlider
+    <div className="h-full border-l border-border bg-bg-primary" style={{ display: 'flex', flexDirection: 'row', alignItems: 'stretch', justifyContent: 'center', gap: '8px', padding: '12px 8px' }}>
+      <VerticalVolumeSlider
         label="Master"
-        icon={<Volume2 size={22} />}
+        icon={<Volume2 size={18} />}
         value={masterVolume}
         isMuted={isMasterMuted}
         onChange={setMasterVolume}
         onToggleMute={toggleMasterMute}
-        color="#a287f4"
+        color="#3cf281"
       />
-      
-      <VolumeSlider
+      <VerticalVolumeSlider
         label="Music"
-        icon={<Music size={22} />}
+        icon={<Music size={18} />}
         value={musicVolume}
         isMuted={isMusicMuted}
         onChange={setMusicVolume}
         onToggleMute={toggleMusicMute}
         color="#12e6c8"
       />
-      
-      <VolumeSlider
+      <VerticalVolumeSlider
         label="Ambient"
-        icon={<Waves size={22} />}
+        icon={<Waves size={18} />}
         value={ambientVolume}
         isMuted={isAmbientMuted}
         onChange={setAmbientVolume}
         onToggleMute={toggleAmbientMute}
-        color="#3cf281"
+        color="#a287f4"
       />
-      
-      <VolumeSlider
+      <VerticalVolumeSlider
         label="Soundboard"
-        icon={<Grid3X3 size={22} />}
+        icon={<Grid3X3 size={18} />}
         value={soundboardVolume}
         isMuted={isSoundboardMuted}
         onChange={setSoundboardVolume}
         onToggleMute={toggleSoundboardMute}
-        color="#a287f4"
+        color="#e44c55"
       />
     </div>
   );

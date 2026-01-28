@@ -78,12 +78,12 @@ export const AdvancedSettings: React.FC = () => {
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center justify-between p-4 border-b border-border">
+    <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
+      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
         <h2 className="text-lg font-semibold text-text-primary">Settings</h2>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-6">
+      <div className="flex-1 overflow-y-auto space-y-6" style={{ paddingRight: '4px' }}>
         <div>
           <h3 className="text-sm font-medium text-text-primary mb-4">Folder Locations</h3>
           <div className="space-y-4">
@@ -118,15 +118,19 @@ export const AdvancedSettings: React.FC = () => {
                 <span className="text-text-secondary">Music Crossfade Duration</span>
                 <span className="text-text-primary">{settings.music_crossfade_duration}s</span>
               </div>
-              <input
-                type="range"
-                min="0"
-                max="10"
-                step="0.5"
-                value={settings.music_crossfade_duration}
-                onChange={(e) => updateSetting('music_crossfade_duration', Number(e.target.value))}
-                className="w-full h-2 rounded appearance-none cursor-pointer bg-bg-secondary"
-              />
+              <div style={{ position: 'relative', height: '24px' }}>
+                <div style={{ position: 'absolute', top: '8px', left: 0, right: 0, height: '8px', borderRadius: '4px', backgroundColor: '#313131' }} />
+                <div style={{ position: 'absolute', top: '8px', left: 0, height: '8px', borderRadius: '4px', background: 'linear-gradient(to right, #12e6c8, #a287f4)', width: `${(settings.music_crossfade_duration / 10) * 100}%` }} />
+                <input
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="0.5"
+                  value={settings.music_crossfade_duration}
+                  onChange={(e) => updateSetting('music_crossfade_duration', Number(e.target.value))}
+                  style={{ position: 'relative', width: '100%', height: '24px', background: 'transparent', cursor: 'pointer' }}
+                />
+              </div>
             </div>
             
             <div>
@@ -134,14 +138,18 @@ export const AdvancedSettings: React.FC = () => {
                 <span className="text-text-secondary">Soundboard Duck Amount</span>
                 <span className="text-text-primary">{Math.round(settings.soundboard_duck_amount * 100)}%</span>
               </div>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={settings.soundboard_duck_amount * 100}
-                onChange={(e) => updateSetting('soundboard_duck_amount', Number(e.target.value) / 100)}
-                className="w-full h-2 rounded appearance-none cursor-pointer bg-bg-secondary"
-              />
+              <div style={{ position: 'relative', height: '24px' }}>
+                <div style={{ position: 'absolute', top: '8px', left: 0, right: 0, height: '8px', borderRadius: '4px', backgroundColor: '#313131' }} />
+                <div style={{ position: 'absolute', top: '8px', left: 0, height: '8px', borderRadius: '4px', background: 'linear-gradient(to right, #12e6c8, #a287f4)', width: `${settings.soundboard_duck_amount * 100}%` }} />
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={settings.soundboard_duck_amount * 100}
+                  onChange={(e) => updateSetting('soundboard_duck_amount', Number(e.target.value) / 100)}
+                  style={{ position: 'relative', width: '100%', height: '24px', background: 'transparent', cursor: 'pointer' }}
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -157,7 +165,7 @@ export const AdvancedSettings: React.FC = () => {
           
           <button
             onClick={handleReset}
-            className="flex items-center justify-center gap-2 px-4 py-3 bg-bg-secondary text-text-secondary rounded-lg hover:text-red-400 hover:bg-bg-secondary/80 transition-colors"
+            className="flex items-center justify-center gap-2 px-4 py-3 bg-bg-secondary text-text-secondary rounded-lg hover:text-accent-red hover:bg-bg-secondary/80 transition-colors"
           >
             <RotateCcw size={20} />
             <span>Reset</span>
