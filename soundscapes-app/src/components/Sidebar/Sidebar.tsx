@@ -105,7 +105,7 @@ export const Sidebar: React.FC = () => {
 
   return (
     <>
-      <div className="w-14 bg-bg-primary border-r border-border flex flex-col items-center" style={{ paddingTop: '8px', paddingBottom: '8px' }}>
+      <div className="w-14 bg-bg-primary/70 backdrop-blur-md border-r border-border/50 flex flex-col items-center" style={{ paddingTop: '8px', paddingBottom: '8px' }}>
         <div className="flex-1 flex flex-col gap-2" style={{ paddingTop: '8px' }}>
           {buttons.map(({ type, icon, title }) => (
             <SidebarButton

@@ -1,10 +1,17 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { FolderOpen, RefreshCw, RotateCcw } from 'lucide-react';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { usePlaylistStore } from '../../stores/playlistStore';
 import { useAmbientStore } from '../../stores/ambientStore';
 import { useSoundboardStore } from '../../stores/soundboardStore';
 import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from '@tauri-apps/api/core';
+
+interface AudioDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
 
 interface FolderSettingProps {
   label: string;
@@ -56,6 +63,24 @@ export const AdvancedSettings: React.FC = () => {
   const { loadAlbums } = usePlaylistStore();
   const { loadCategories } = useAmbientStore();
   const { loadSounds } = useSoundboardStore();
+  const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<string>('');
+
+  useEffect(() => {
+    const loadDevices = async () => {
+      try {
+        const devices = await invoke<AudioDevice[]>('get_output_devices');
+        setOutputDevices(devices);
+        const defaultDevice = devices.find(d => d.is_default);
+        if (defaultDevice) {
+          setSelectedDevice(defaultDevice.id);
+        }
+      } catch (error) {
+        console.error('Failed to load output devices:', error);
+      }
+    };
+    loadDevices();
+  }, []);
 
   if (!settings) {
     return (
@@ -113,6 +138,21 @@ export const AdvancedSettings: React.FC = () => {
         <div>
           <h3 className="text-sm font-medium text-text-primary mb-4">Audio Settings</h3>
           <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm text-text-secondary">Output Device</label>
+              <select
+                value={selectedDevice}
+                onChange={(e) => setSelectedDevice(e.target.value)}
+                className="w-full px-3 py-2 bg-bg-secondary rounded-lg text-text-primary text-sm border border-border focus:outline-none focus:border-accent-purple"
+              >
+                {outputDevices.map((device) => (
+                  <option key={device.id} value={device.id}>
+                    {device.name}{device.is_default ? ' (Default)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            
             <div>
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-text-secondary">Music Crossfade Duration</span>

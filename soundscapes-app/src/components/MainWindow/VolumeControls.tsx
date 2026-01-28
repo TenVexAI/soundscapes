@@ -104,7 +104,7 @@ export const VolumeControls: React.FC = () => {
   } = useAudioStore();
 
   return (
-    <div className="h-full border-l border-border bg-bg-primary" style={{ display: 'flex', flexDirection: 'row', alignItems: 'stretch', justifyContent: 'center', gap: '8px', padding: '12px 8px' }}>
+    <div className="h-full border-l border-border/50 bg-bg-primary/70 backdrop-blur-md" style={{ display: 'flex', flexDirection: 'row', alignItems: 'stretch', justifyContent: 'center', gap: '8px', padding: '12px 8px' }}>
       <VerticalVolumeSlider
         label="Master"
         icon={<Volume2 size={18} />}

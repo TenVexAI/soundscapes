@@ -10,8 +10,10 @@ use std::thread;
 use std::time::Instant;
 use parking_lot::Mutex;
 use rand::Rng;
-use rodio::{Decoder, OutputStream, Sink, Source};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use walkdir::WalkDir;
+use rustfft::{FftPlanner, num_complex::Complex};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MusicTrack {
@@ -180,9 +182,96 @@ struct AudioProgress {
     is_finished: bool,
 }
 
+// Number of FFT frequency bins to send to frontend
+const FFT_SIZE: usize = 64;
+
+// Playback state for visualization with FFT data
+#[derive(Clone)]
+struct PlaybackState {
+    music_playing: bool,
+    music_volume: f32,
+    ambient_count: u32,
+    ambient_volume: f32,
+    master_volume: f32,
+    is_muted: bool,
+    // FFT frequency data (0.0-1.0 for each bin)
+    frequencies: Vec<f32>,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            music_playing: false,
+            music_volume: 0.0,
+            ambient_count: 0,
+            ambient_volume: 0.0,
+            master_volume: 1.0,
+            is_muted: false,
+            frequencies: vec![0.0; FFT_SIZE],
+        }
+    }
+}
+
+// Source wrapper that copies samples for FFT analysis
+struct AnalyzingSource<S> {
+    inner: S,
+    sample_buffer: Arc<Mutex<Vec<f32>>>,
+    buffer_size: usize,
+}
+
+impl<S> AnalyzingSource<S> {
+    fn new(inner: S, sample_buffer: Arc<Mutex<Vec<f32>>>, buffer_size: usize) -> Self {
+        Self { inner, sample_buffer, buffer_size }
+    }
+}
+
+impl<S> Iterator for AnalyzingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        
+        let mut buffer = self.sample_buffer.lock();
+        buffer.push(sample);
+        
+        // Keep buffer at fixed size (ring buffer behavior)
+        if buffer.len() > self.buffer_size {
+            buffer.remove(0);
+        }
+        
+        Some(sample)
+    }
+}
+
+impl<S> Source for AnalyzingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
 struct AudioController {
     command_tx: Sender<AudioCommand>,
     progress: Arc<Mutex<AudioProgress>>,
+    playback_state: Arc<Mutex<PlaybackState>>,
+    sample_buffer: Arc<Mutex<Vec<f32>>>,
 }
 
 impl AudioController {
@@ -194,8 +283,12 @@ impl AudioController {
             is_playing: false,
             is_finished: true,
         }));
+        let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
+        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(2048)));
         
         let progress_clone = progress.clone();
+        let playback_state_clone = playback_state.clone();
+        let sample_buffer_clone = sample_buffer.clone();
         
         // Spawn audio thread
         thread::spawn(move || {
@@ -214,6 +307,11 @@ impl AudioController {
             let mut is_master_muted = false;
             let mut track_start: Option<Instant> = None;
             let mut track_duration: f64 = 0.0;
+            
+            // FFT setup
+            let mut fft_planner = FftPlanner::<f32>::new();
+            let fft = fft_planner.plan_fft_forward(1024);
+            let mut fft_buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 1024];
             
             // Ambient sounds state - A/B crossfade system
             struct AmbientState {
@@ -268,6 +366,64 @@ impl AudioController {
                     }
                 }
                 
+                // Update playback state for visualization with FFT
+                {
+                    let music_playing = current_sink.as_ref()
+                        .map(|s| !s.empty() && !s.is_paused())
+                        .unwrap_or(false);
+                    
+                    let active_ambient_count = ambient_states.values()
+                        .filter(|s| !s.is_paused && !s.sink.empty())
+                        .count() as u32;
+                    
+                    let effective_music_vol = if is_muted || is_master_muted { 0.0 } else { music_volume * master_volume };
+                    let effective_ambient_vol = if is_ambient_muted || is_master_muted { 0.0 } else { ambient_master_volume * master_volume };
+                    
+                    // Perform FFT on sample buffer
+                    let mut frequencies = vec![0.0f32; FFT_SIZE];
+                    {
+                        let samples = sample_buffer_clone.lock();
+                        if samples.len() >= 1024 {
+                            // Copy samples to FFT buffer with Hann window
+                            for (i, &sample) in samples.iter().rev().take(1024).enumerate() {
+                                let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 1023.0).cos());
+                                fft_buffer[i] = Complex::new(sample * window, 0.0);
+                            }
+                            
+                            // Run FFT
+                            fft.process(&mut fft_buffer);
+                            
+                            // Convert to magnitudes and bin into FFT_SIZE buckets
+                            let bins_per_bucket = 512 / FFT_SIZE; // Only use first half (positive frequencies)
+                            
+                            for i in 0..FFT_SIZE {
+                                let mut sum = 0.0f32;
+                                for j in 0..bins_per_bucket {
+                                    let idx = i * bins_per_bucket + j;
+                                    if idx < 512 {
+                                        sum += fft_buffer[idx].norm();
+                                    }
+                                }
+                                // Average the bin values
+                                let mag = sum / bins_per_bucket as f32;
+                                // Use log scale for better dynamic range
+                                // Higher multiplier = more sensitive, lower divisor = brighter output
+                                let log_mag = (1.0 + mag * 50.0).ln() / 5.0;
+                                frequencies[i] = log_mag.clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                    
+                    let mut state = playback_state_clone.lock();
+                    state.music_playing = music_playing;
+                    state.music_volume = effective_music_vol;
+                    state.ambient_count = active_ambient_count;
+                    state.ambient_volume = effective_ambient_vol;
+                    state.master_volume = master_volume;
+                    state.is_muted = is_master_muted;
+                    state.frequencies = frequencies;
+                }
+                
                 // Check for commands (non-blocking with timeout)
                 match command_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(cmd) => match cmd {
@@ -276,6 +432,9 @@ impl AudioController {
                             if let Some(sink) = current_sink.take() {
                                 sink.stop();
                             }
+                            
+                            // Clear sample buffer for new track
+                            sample_buffer_clone.lock().clear();
                             
                             // Load and play new file
                             match File::open(&path) {
@@ -287,6 +446,14 @@ impl AudioController {
                                                 .map(|d| d.as_secs_f64())
                                                 .unwrap_or(0.0);
                                             
+                                            // Convert to f32 samples and wrap with AnalyzingSource for FFT
+                                            let source_f32 = source.convert_samples::<f32>();
+                                            let analyzing_source = AnalyzingSource::new(
+                                                source_f32,
+                                                sample_buffer_clone.clone(),
+                                                2048
+                                            );
+                                            
                                             match Sink::try_new(&stream_handle) {
                                                 Ok(sink) => {
                                                     let effective_vol = if is_muted || is_master_muted {
@@ -295,7 +462,7 @@ impl AudioController {
                                                         music_volume * master_volume
                                                     };
                                                     sink.set_volume(effective_vol);
-                                                    sink.append(source);
+                                                    sink.append(analyzing_source);
                                                     
                                                     track_start = Some(Instant::now());
                                                     track_duration = duration;
@@ -593,7 +760,7 @@ impl AudioController {
             }
         });
         
-        Self { command_tx, progress }
+        Self { command_tx, progress, playback_state, sample_buffer }
     }
     
     fn send(&self, cmd: AudioCommand) {
@@ -602,6 +769,10 @@ impl AudioController {
     
     fn get_progress(&self) -> AudioProgress {
         self.progress.lock().clone()
+    }
+    
+    fn get_playback_state(&self) -> PlaybackState {
+        self.playback_state.lock().clone()
     }
 }
 
@@ -844,6 +1015,31 @@ fn get_music_progress(state: tauri::State<Arc<AudioController>>) -> Result<Music
     })
 }
 
+#[derive(Debug, Serialize)]
+struct PlaybackStateResponse {
+    music_playing: bool,
+    music_volume: f32,
+    ambient_count: u32,
+    ambient_volume: f32,
+    master_volume: f32,
+    is_muted: bool,
+    frequencies: Vec<f32>,
+}
+
+#[tauri::command]
+fn get_playback_state(state: tauri::State<Arc<AudioController>>) -> Result<PlaybackStateResponse, String> {
+    let ps = state.get_playback_state();
+    Ok(PlaybackStateResponse {
+        music_playing: ps.music_playing,
+        music_volume: ps.music_volume,
+        ambient_count: ps.ambient_count,
+        ambient_volume: ps.ambient_volume,
+        master_volume: ps.master_volume,
+        is_muted: ps.is_muted,
+        frequencies: ps.frequencies,
+    })
+}
+
 // Ambient sound commands
 #[tauri::command]
 fn play_ambient(
@@ -919,6 +1115,35 @@ fn set_ambient_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> 
     Ok(())
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct AudioDevice {
+    id: String,
+    name: String,
+    is_default: bool,
+}
+
+#[tauri::command]
+fn get_output_devices() -> Result<Vec<AudioDevice>, String> {
+    let host = rodio::cpal::default_host();
+    let default_device = host.default_output_device();
+    let default_name = default_device.as_ref().and_then(|d| d.name().ok());
+    
+    let devices: Vec<AudioDevice> = host.output_devices()
+        .map_err(|e| format!("Failed to enumerate devices: {}", e))?
+        .filter_map(|device| {
+            let name = device.name().ok()?;
+            let is_default = default_name.as_ref().map(|dn| dn == &name).unwrap_or(false);
+            Some(AudioDevice {
+                id: name.clone(),
+                name,
+                is_default,
+            })
+        })
+        .collect();
+    
+    Ok(devices)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let audio_controller = Arc::new(AudioController::new());
@@ -945,11 +1170,13 @@ pub fn run() {
             set_music_muted,
             set_master_muted,
             get_music_progress,
+            get_playback_state,
             play_ambient,
             stop_ambient,
             update_ambient_settings,
             set_ambient_master_volume,
-            set_ambient_muted
+            set_ambient_muted,
+            get_output_devices
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

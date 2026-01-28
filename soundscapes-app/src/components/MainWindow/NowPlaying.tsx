@@ -40,7 +40,7 @@ export const NowPlaying: React.FC = () => {
     : 0;
 
   return (
-    <div className={`relative overflow-hidden rounded-xl bg-gradient-to-r from-bg-secondary/80 to-bg-secondary/40 border border-border/50 backdrop-blur-md ${isMusicMuted ? 'opacity-50' : ''}`}>
+    <div className={`relative overflow-hidden rounded-xl bg-bg-primary/70 border border-border/50 backdrop-blur-md ${isMusicMuted ? 'opacity-50' : ''}`}>
       {/* Subtle glow effect */}
       <div className="absolute inset-0 bg-gradient-to-r from-accent-purple/5 to-accent-cyan/5 pointer-events-none" />
       
