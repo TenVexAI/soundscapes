@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, Star, Play, ListPlus, ListStart, Shuffle, Repeat, Plus, Music, Trash2, Square } from 'lucide-react';
+import { ChevronDown, ChevronRight, Star, Play, ListPlus, ListStart, Shuffle, Repeat, Plus, Music, Trash2, Square, Pencil } from 'lucide-react';
 import { usePlaylistStore } from '../../stores/playlistStore';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -96,6 +96,7 @@ export const MusicPlaylist: React.FC = () => {
     toggleFavorite,
     createPlaylist,
     deletePlaylist,
+    updatePlaylist,
   } = usePlaylistStore();
 
   const wasPlayingRef = useRef(false);
@@ -142,6 +143,10 @@ export const MusicPlaylist: React.FC = () => {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [playlistToDelete, setPlaylistToDelete] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  
+  // Edit mode state
+  const [editingPlaylistId, setEditingPlaylistId] = useState<string | null>(null);
+  const [editingPlaylistName, setEditingPlaylistName] = useState<string>('');
 
   const toggleAlbum = (albumName: string) => {
     const newExpanded = new Set(expandedAlbums);
@@ -157,6 +162,20 @@ export const MusicPlaylist: React.FC = () => {
   const showToast = (message: string) => {
     setToastMessage(message);
     setTimeout(() => setToastMessage(null), 3000);
+  };
+
+  // Enter edit mode for a playlist
+  const handleEditPlaylist = (playlistId: string) => {
+    const playlist = playlists.find(p => p.id === playlistId);
+    if (!playlist || playlist.isAuto) return;
+    
+    // Pre-select all tracks from the playlist
+    const trackIds = new Set(playlist.tracks.map(t => t.id));
+    setSelectedTracks(trackIds);
+    setEditingPlaylistId(playlistId);
+    setEditingPlaylistName(playlist.name);
+    setIsSelectMode(true);
+    setSelectedPlaylistId(null); // Switch to Library View
   };
 
   const handleCreatePlaylist = async () => {
@@ -186,7 +205,40 @@ export const MusicPlaylist: React.FC = () => {
       setShowCreateDialog(false);
       setIsSelectMode(false);
     } catch (error) {
-      console.error('Error creating playlist:', error);
+      const message = error instanceof Error ? error.message : 'Error creating playlist';
+      showToast(message);
+    }
+  };
+
+  // Save edited playlist
+  const handleSaveEditedPlaylist = async () => {
+    if (!editingPlaylistId) return;
+    
+    const selectedTracksList: PlaylistTrack[] = [];
+    albums.forEach(album => {
+      album.tracks.forEach(track => {
+        if (selectedTracks.has(track.id)) {
+          selectedTracksList.push({
+            id: track.id,
+            file: track.file,
+            title: track.title,
+            artist: track.artist,
+            album: album.name,
+            albumPath: album.path,
+          });
+        }
+      });
+    });
+    
+    try {
+      await updatePlaylist(editingPlaylistId, selectedTracksList);
+      showToast(`Playlist "${editingPlaylistName}" updated!`);
+      setSelectedTracks(new Set());
+      setIsSelectMode(false);
+      setEditingPlaylistId(null);
+      setEditingPlaylistName('');
+    } catch (error) {
+      console.error('Error updating playlist:', error);
     }
   };
 
@@ -316,6 +368,7 @@ export const MusicPlaylist: React.FC = () => {
             onClick={() => {
               setIsSelectMode(!isSelectMode);
               setSelectedTracks(new Set());
+              setSelectedPlaylistId(null); // Switch to Library View
             }}
             className={`p-2 rounded-lg transition-colors ${
               isSelectMode ? 'text-accent-green' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
@@ -338,20 +391,34 @@ export const MusicPlaylist: React.FC = () => {
 
       {/* Select mode bar */}
       {isSelectMode && (
-        <div className="flex items-center gap-2 mb-3 p-2 bg-accent-green/10 rounded-lg">
-          <span className="text-sm text-text-secondary">{selectedTracks.size} selected</span>
+        <div className={`flex items-center gap-2 mb-3 p-2 rounded-lg ${editingPlaylistId ? 'bg-accent-cyan/10' : 'bg-accent-green/10'}`}>
+          <span className="text-sm text-text-secondary">
+            {editingPlaylistId ? `Editing "${editingPlaylistName}" - ` : ''}{selectedTracks.size} selected
+          </span>
           <div className="flex-1" />
-          <button
-            onClick={() => setShowCreateDialog(true)}
-            disabled={selectedTracks.size === 0}
-            className="px-3 py-1 text-sm bg-accent-green/20 text-accent-green hover:bg-accent-green hover:text-white rounded-lg disabled:opacity-50"
-          >
-            Create Playlist
-          </button>
+          {editingPlaylistId ? (
+            <button
+              onClick={handleSaveEditedPlaylist}
+              disabled={selectedTracks.size === 0}
+              className="px-3 py-1 text-sm bg-accent-cyan/20 text-accent-cyan hover:bg-accent-cyan hover:text-white rounded-lg disabled:opacity-50"
+            >
+              Save Changes
+            </button>
+          ) : (
+            <button
+              onClick={() => setShowCreateDialog(true)}
+              disabled={selectedTracks.size === 0}
+              className="px-3 py-1 text-sm bg-accent-green/20 text-accent-green hover:bg-accent-green hover:text-white rounded-lg disabled:opacity-50"
+            >
+              Create Playlist
+            </button>
+          )}
           <button
             onClick={() => {
               setIsSelectMode(false);
               setSelectedTracks(new Set());
+              setEditingPlaylistId(null);
+              setEditingPlaylistName('');
             }}
             className="px-3 py-1 text-sm text-text-secondary hover:text-text-primary"
           >
@@ -385,16 +452,25 @@ export const MusicPlaylist: React.FC = () => {
                   </button>
                 )}
                 {!selectedPlaylist.isAuto && (
-                  <button
-                    onClick={() => {
-                      setPlaylistToDelete(selectedPlaylistId);
-                      setShowDeleteConfirm(true);
-                    }}
-                    className="p-1 text-text-secondary hover:text-accent-red"
-                    title="Delete playlist"
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  <>
+                    <button
+                      onClick={() => handleEditPlaylist(selectedPlaylistId)}
+                      className="p-1 text-text-secondary hover:text-accent-cyan"
+                      title="Edit playlist"
+                    >
+                      <Pencil size={14} />
+                    </button>
+                    <button
+                      onClick={() => {
+                        setPlaylistToDelete(selectedPlaylistId);
+                        setShowDeleteConfirm(true);
+                      }}
+                      className="p-1 text-text-secondary hover:text-accent-red"
+                      title="Delete playlist"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </>
                 )}
               </div>
             </div>

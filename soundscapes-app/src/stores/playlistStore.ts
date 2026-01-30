@@ -64,6 +64,7 @@ interface PlaylistState {
   createPlaylist: (name: string, tracks: PlaylistTrack[]) => Promise<void>;
   deletePlaylist: (id: string) => Promise<void>;
   addToPlaylist: (playlistId: string, tracks: PlaylistTrack[]) => Promise<void>;
+  updatePlaylist: (playlistId: string, tracks: PlaylistTrack[]) => Promise<void>;
   
   // Helpers
   getCurrentPlaylist: () => MusicPlaylist | null;
@@ -315,10 +316,17 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   
   createPlaylist: async (name: string, tracks: PlaylistTrack[]) => {
     const id = `playlist-${Date.now()}`;
+    const { playlists } = get();
     
     // Validate name
     if (name.toLowerCase() === 'favorites' || name.toLowerCase() === 'all music') {
       throw new Error('Cannot use reserved playlist name');
+    }
+    
+    // Check for duplicate names (case-insensitive)
+    const nameExists = playlists.some(p => p.name.toLowerCase() === name.toLowerCase());
+    if (nameExists) {
+      throw new Error('A playlist with this name already exists');
     }
     
     await invoke('save_playlist', { id, name, tracks });
@@ -346,6 +354,20 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
     set(state => ({
       playlists: state.playlists.map(p => 
         p.id === playlistId ? { ...p, tracks: newTracks } : p
+      ),
+    }));
+  },
+  
+  updatePlaylist: async (playlistId: string, tracks: PlaylistTrack[]) => {
+    const { playlists } = get();
+    const playlist = playlists.find(p => p.id === playlistId);
+    if (!playlist || playlist.isAuto) return;
+    
+    await invoke('save_playlist', { id: playlistId, name: playlist.name, tracks });
+    
+    set(state => ({
+      playlists: state.playlists.map(p => 
+        p.id === playlistId ? { ...p, tracks } : p
       ),
     }));
   },
