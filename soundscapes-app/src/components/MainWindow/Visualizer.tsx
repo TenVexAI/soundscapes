@@ -162,6 +162,7 @@ export const Visualizer: React.FC = () => {
   });
   const frequencyTextureRef = useRef<WebGLTexture | null>(null);
   const smoothedFreqRef = useRef<Float32Array>(new Float32Array(64));
+  const mouseRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const { isMasterMuted } = useAudioStore();
   
   const [currentVizId, setCurrentVizId] = useState<string>(DEFAULT_VISUALIZATION);
@@ -349,6 +350,7 @@ export const Visualizer: React.FC = () => {
         gl.uniform1f(gl.getUniformLocation(prog, 'u_ambient_count'), state.ambient_count);
         gl.uniform1f(gl.getUniformLocation(prog, 'u_ambient_volume'), state.ambient_volume);
         gl.uniform2f(gl.getUniformLocation(prog, 'u_center_offset'), -40.0, 36.0);
+        gl.uniform2f(gl.getUniformLocation(prog, 'u_mouse'), mouseRef.current.x * width, mouseRef.current.y * height);
       };
 
       // Render buffer passes with ping-pong to avoid feedback loops
@@ -442,11 +444,20 @@ export const Visualizer: React.FC = () => {
     return () => resizeObserver.disconnect();
   }, []);
 
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    mouseRef.current.x = (e.clientX - rect.left) / rect.width;
+    mouseRef.current.y = 1.0 - (e.clientY - rect.top) / rect.height; // Flip Y for GL
+  };
+
   return (
     <div ref={containerRef} className="flex-1 w-full h-full">
       <canvas
         ref={canvasRef}
         className="w-full h-full"
+        onMouseMove={handleMouseMove}
       />
     </div>
   );

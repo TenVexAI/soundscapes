@@ -1,11 +1,13 @@
 import { Visualization } from './types';
 import { orbVisualization } from './shaders/orb';
 import { barsVisualization } from './shaders/bars';
+import { simplebarsVisualization } from './shaders/simplebars';
 
 // Registry of all available visualizations
 export const visualizations: Record<string, Visualization> = {
   orb: orbVisualization,
   bars: barsVisualization,
+  simplebars: simplebarsVisualization,
 };
 
 // Get visualization by ID, with fallback to orb
