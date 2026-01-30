@@ -212,16 +212,55 @@ impl Default for PlaybackState {
     }
 }
 
-// Source wrapper that copies samples for FFT analysis
+// Lock-free circular buffer for FFT samples - avoids mutex contention that causes static
+const FFT_BUFFER_SIZE: usize = 2048;
+
+struct FftSampleBuffer {
+    buffer: [std::sync::atomic::AtomicU32; FFT_BUFFER_SIZE],
+    write_pos: std::sync::atomic::AtomicUsize,
+}
+
+impl FftSampleBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            write_pos: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    
+    fn push(&self, sample: f32) {
+        let pos = self.write_pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % FFT_BUFFER_SIZE;
+        self.buffer[pos].store(sample.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    fn get_latest(&self, count: usize) -> Vec<f32> {
+        let write_pos = self.write_pos.load(std::sync::atomic::Ordering::Relaxed);
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let pos = (write_pos + FFT_BUFFER_SIZE - count + i) % FFT_BUFFER_SIZE;
+            let bits = self.buffer[pos].load(std::sync::atomic::Ordering::Relaxed);
+            result.push(f32::from_bits(bits));
+        }
+        result
+    }
+    
+    fn clear(&self) {
+        self.write_pos.store(0, std::sync::atomic::Ordering::Relaxed);
+        for atom in &self.buffer {
+            atom.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// Source wrapper that copies samples for FFT analysis (lock-free)
 struct AnalyzingSource<S> {
     inner: S,
-    sample_buffer: Arc<Mutex<Vec<f32>>>,
-    buffer_size: usize,
+    sample_buffer: Arc<FftSampleBuffer>,
 }
 
 impl<S> AnalyzingSource<S> {
-    fn new(inner: S, sample_buffer: Arc<Mutex<Vec<f32>>>, buffer_size: usize) -> Self {
-        Self { inner, sample_buffer, buffer_size }
+    fn new(inner: S, sample_buffer: Arc<FftSampleBuffer>) -> Self {
+        Self { inner, sample_buffer }
     }
 }
 
@@ -233,15 +272,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.inner.next()?;
-        
-        let mut buffer = self.sample_buffer.lock();
-        buffer.push(sample);
-        
-        // Keep buffer at fixed size (ring buffer behavior)
-        if buffer.len() > self.buffer_size {
-            buffer.remove(0);
-        }
-        
+        self.sample_buffer.push(sample);
         Some(sample)
     }
 }
@@ -271,7 +302,7 @@ struct AudioController {
     command_tx: Sender<AudioCommand>,
     progress: Arc<Mutex<AudioProgress>>,
     playback_state: Arc<Mutex<PlaybackState>>,
-    sample_buffer: Arc<Mutex<Vec<f32>>>,
+    sample_buffer: Arc<FftSampleBuffer>,
 }
 
 impl AudioController {
@@ -284,7 +315,7 @@ impl AudioController {
             is_finished: true,
         }));
         let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
-        let sample_buffer = Arc::new(Mutex::new(Vec::with_capacity(2048)));
+        let sample_buffer = Arc::new(FftSampleBuffer::new());
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
@@ -379,38 +410,35 @@ impl AudioController {
                     let effective_music_vol = if is_muted || is_master_muted { 0.0 } else { music_volume * master_volume };
                     let effective_ambient_vol = if is_ambient_muted || is_master_muted { 0.0 } else { ambient_master_volume * master_volume };
                     
-                    // Perform FFT on sample buffer
+                    // Perform FFT on sample buffer (lock-free read)
                     let mut frequencies = vec![0.0f32; FFT_SIZE];
                     {
-                        let samples = sample_buffer_clone.lock();
-                        if samples.len() >= 1024 {
-                            // Copy samples to FFT buffer with Hann window
-                            for (i, &sample) in samples.iter().rev().take(1024).enumerate() {
-                                let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 1023.0).cos());
-                                fft_buffer[i] = Complex::new(sample * window, 0.0);
-                            }
-                            
-                            // Run FFT
-                            fft.process(&mut fft_buffer);
-                            
-                            // Convert to magnitudes and bin into FFT_SIZE buckets
-                            let bins_per_bucket = 512 / FFT_SIZE; // Only use first half (positive frequencies)
-                            
-                            for i in 0..FFT_SIZE {
-                                let mut sum = 0.0f32;
-                                for j in 0..bins_per_bucket {
-                                    let idx = i * bins_per_bucket + j;
-                                    if idx < 512 {
-                                        sum += fft_buffer[idx].norm();
-                                    }
+                        let samples = sample_buffer_clone.get_latest(1024);
+                        // Copy samples to FFT buffer with Hann window
+                        for (i, &sample) in samples.iter().enumerate() {
+                            let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 1023.0).cos());
+                            fft_buffer[i] = Complex::new(sample * window, 0.0);
+                        }
+                        
+                        // Run FFT
+                        fft.process(&mut fft_buffer);
+                        
+                        // Convert to magnitudes and bin into FFT_SIZE buckets
+                        let bins_per_bucket = 512 / FFT_SIZE; // Only use first half (positive frequencies)
+                        
+                        for i in 0..FFT_SIZE {
+                            let mut sum = 0.0f32;
+                            for j in 0..bins_per_bucket {
+                                let idx = i * bins_per_bucket + j;
+                                if idx < 512 {
+                                    sum += fft_buffer[idx].norm();
                                 }
-                                // Average the bin values
-                                let mag = sum / bins_per_bucket as f32;
-                                // Use log scale for better dynamic range
-                                // Higher multiplier = more sensitive, lower divisor = brighter output
-                                let log_mag = (1.0 + mag * 50.0).ln() / 5.0;
-                                frequencies[i] = log_mag.clamp(0.0, 1.0);
                             }
+                            // Average the bin values
+                            let mag = sum / bins_per_bucket as f32;
+                            // Use log scale for better dynamic range
+                            let log_mag = (1.0 + mag * 50.0).ln() / 5.0;
+                            frequencies[i] = log_mag.clamp(0.0, 1.0);
                         }
                     }
                     
@@ -434,7 +462,7 @@ impl AudioController {
                             }
                             
                             // Clear sample buffer for new track
-                            sample_buffer_clone.lock().clear();
+                            sample_buffer_clone.clear();
                             
                             // Load and play new file
                             match File::open(&path) {
@@ -450,8 +478,7 @@ impl AudioController {
                                             let source_f32 = source.convert_samples::<f32>();
                                             let analyzing_source = AnalyzingSource::new(
                                                 source_f32,
-                                                sample_buffer_clone.clone(),
-                                                2048
+                                                sample_buffer_clone.clone()
                                             );
                                             
                                             match Sink::try_new(&stream_handle) {
