@@ -1,7 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAudioStore } from '../../stores/audioStore';
-import { useSettingsStore } from '../../stores/settingsStore';
 import { getVisualization, DEFAULT_VISUALIZATION } from '../../visualizations';
 
 interface PlaybackState {
@@ -68,17 +67,35 @@ export const Visualizer: React.FC = () => {
   const frequencyTextureRef = useRef<WebGLTexture | null>(null);
   const smoothedFreqRef = useRef<Float32Array>(new Float32Array(64));
   const { isMasterMuted } = useAudioStore();
-  const { settings } = useSettingsStore();
   
   const [currentVizId, setCurrentVizId] = useState<string>(DEFAULT_VISUALIZATION);
 
-  // Track visualization setting changes
+  // Poll visualization type from backend (settings window is separate process)
   useEffect(() => {
-    const vizId = settings?.visualization_type || DEFAULT_VISUALIZATION;
-    if (vizId !== currentVizId) {
-      setCurrentVizId(vizId);
-    }
-  }, [settings?.visualization_type, currentVizId]);
+    let mounted = true;
+    
+    const pollVizType = async () => {
+      if (!mounted) return;
+      try {
+        const backendSettings = await invoke<{ visualization_type?: string }>('get_settings');
+        const vizId = backendSettings?.visualization_type || DEFAULT_VISUALIZATION;
+        if (vizId !== currentVizId) {
+          setCurrentVizId(vizId);
+        }
+      } catch {
+        // Ignore errors
+      }
+      if (mounted) {
+        setTimeout(pollVizType, 500); // Check every 500ms
+      }
+    };
+    
+    pollVizType();
+    
+    return () => {
+      mounted = false;
+    };
+  }, [currentVizId]);
 
   // Poll playback state from backend
   useEffect(() => {
@@ -104,10 +121,16 @@ export const Visualizer: React.FC = () => {
     };
   }, []);
 
-  // Initialize/reinitialize WebGL when visualization changes
+  // Initialize WebGL and run animation loop
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    // Clean up existing animation
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = undefined;
+    }
 
     // Clean up existing program
     if (programRef.current && glRef.current) {
@@ -148,35 +171,18 @@ export const Visualizer: React.FC = () => {
     gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
 
     // Create frequency texture (64x1 texture for FFT data)
-    if (!frequencyTextureRef.current) {
-      const freqTexture = gl.createTexture();
-      frequencyTextureRef.current = freqTexture;
-      gl.bindTexture(gl.TEXTURE_2D, freqTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 64, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array(64));
-    }
+    const freqTexture = gl.createTexture();
+    frequencyTextureRef.current = freqTexture;
+    gl.bindTexture(gl.TEXTURE_2D, freqTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 64, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array(64));
 
     startTimeRef.current = Date.now();
 
-    return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-    };
-  }, [currentVizId]);
-
-  // Animation loop
-  useEffect(() => {
-    const gl = glRef.current;
-    const program = programRef.current;
-    const canvas = canvasRef.current;
-    const freqTexture = frequencyTextureRef.current;
-    
-    if (!gl || !program || !canvas || !freqTexture) return;
-
+    // Animation loop - uses captured gl, program, canvas, freqTexture
     const render = () => {
       animationRef.current = requestAnimationFrame(render);
 
@@ -223,6 +229,9 @@ export const Visualizer: React.FC = () => {
       gl.uniform1i(gl.getUniformLocation(program, 'u_ambient_only'), ambientOnly ? 1 : 0);
       gl.uniform1f(gl.getUniformLocation(program, 'u_ambient_count'), state.ambient_count);
       gl.uniform1f(gl.getUniformLocation(program, 'u_ambient_volume'), state.ambient_volume);
+      // Center offset to account for UI overlays (sidebar=56px, volume=136px, nowplaying=72px)
+      // X offset: (volume - sidebar) / 2 = 40px left, Y offset: nowplaying / 2 = 36px up
+      gl.uniform2f(gl.getUniformLocation(program, 'u_center_offset'), -40.0, 36.0);
       
       // Bind frequency texture
       gl.activeTexture(gl.TEXTURE0);
@@ -240,7 +249,7 @@ export const Visualizer: React.FC = () => {
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [isMasterMuted, currentVizId]);
+  }, [currentVizId, isMasterMuted]);
 
   // Handle canvas resize
   useEffect(() => {

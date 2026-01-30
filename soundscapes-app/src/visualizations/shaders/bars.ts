@@ -17,6 +17,7 @@ const fragment = `
   uniform bool u_ambient_only;
   uniform float u_ambient_count;
   uniform float u_ambient_volume;
+  uniform vec2 u_center_offset;
   
   const float PI = 3.14159265;
   const float bars = 32.0;
@@ -30,7 +31,8 @@ const fragment = `
   
   void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution.xy;
-    vec2 p = uv * 2.0 - 1.0;
+    // Apply center offset (in pixels) to shift visualization center
+    vec2 p = uv * 2.0 - 1.0 - (u_center_offset * 2.0 / u_resolution.xy);
     p.x *= u_resolution.x / u_resolution.y;
     
     vec3 c = vec3(0.0, 0.0, 0.08);

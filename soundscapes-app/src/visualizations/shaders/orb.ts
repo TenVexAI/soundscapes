@@ -17,6 +17,7 @@ const fragment = `
   uniform bool u_ambient_only;
   uniform float u_ambient_count;
   uniform float u_ambient_volume;
+  uniform vec2 u_center_offset;
   
   const float dots = 64.0;
   const float radius = 0.22;
@@ -42,7 +43,8 @@ const fragment = `
   }
   
   void main() {
-    vec2 p = (gl_FragCoord.xy - 0.5 * u_resolution.xy) / min(u_resolution.x, u_resolution.y);
+    // Apply center offset (in pixels) to shift visualization center
+    vec2 p = (gl_FragCoord.xy - 0.5 * u_resolution.xy - u_center_offset) / min(u_resolution.x, u_resolution.y);
     float time = u_time;
     
     // Get bass energy from first few frequency bins for tempo-reactive rotation
