@@ -2,6 +2,26 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { AmbientCategory, AmbientSound, AmbientSoundDef, DEFAULT_AMBIENT_SETTINGS } from '../types';
 
+// Backend response for active ambient info
+interface ActiveAmbientInfo {
+  id: string;
+  file_a: string;
+  file_b: string;
+  settings: {
+    volume: number;
+    pitch: number;
+    pan: number;
+    low_pass_freq: number;
+    reverb_type: string;
+    algorithmic_reverb: number;
+    repeat_min: number;
+    repeat_max: number;
+    pause_min: number;
+    pause_max: number;
+    volume_variation: number;
+  };
+}
+
 interface AmbientState {
   categories: AmbientCategory[];
   activeSounds: Map<string, AmbientSound>;
@@ -10,6 +30,7 @@ interface AmbientState {
   hideUnselected: boolean;
   
   loadCategories: (folderPath: string) => Promise<void>;
+  syncActiveFromBackend: () => Promise<void>;
   toggleSound: (categoryPath: string, sound: AmbientSoundDef, categoryName: string) => void;
   loadSoundWithSettings: (sound: AmbientSound) => Promise<void>;
   updateSoundSettings: (soundId: string, settings: Partial<AmbientSound>) => void;
@@ -50,6 +71,63 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
     } catch (error) {
       console.error('Error loading ambient categories:', error);
       set({ isLoading: false });
+    }
+  },
+  
+  syncActiveFromBackend: async () => {
+    // Query backend for currently playing ambient sounds and restore UI state
+    try {
+      const activeInfos = await invoke<ActiveAmbientInfo[]>('get_active_ambients');
+      if (activeInfos.length > 0) {
+        const { categories } = get();
+        const newActiveSounds = new Map<string, AmbientSound>();
+        
+        for (const info of activeInfos) {
+          // Find the sound definition in categories to get name and category info
+          let soundName = info.id;
+          let categoryId = '';
+          let categoryPath = '';
+          let filesA = '';
+          let filesB = '';
+          
+          for (const category of categories) {
+            const soundDef = category.sounds.find(s => s.id === info.id);
+            if (soundDef) {
+              soundName = soundDef.name;
+              categoryId = category.name;
+              categoryPath = category.path;
+              filesA = soundDef.files.a;
+              filesB = soundDef.files.b;
+              break;
+            }
+          }
+          
+          newActiveSounds.set(info.id, {
+            id: info.id,
+            name: soundName,
+            categoryId,
+            categoryPath,
+            filesA,
+            filesB,
+            enabled: true,
+            volume: info.settings.volume,
+            pitch: info.settings.pitch,
+            pan: info.settings.pan,
+            lowPassFreq: info.settings.low_pass_freq,
+            reverbType: info.settings.reverb_type as AmbientSound['reverbType'],
+            algorithmicReverb: info.settings.algorithmic_reverb,
+            repeatRangeMin: info.settings.repeat_min,
+            repeatRangeMax: info.settings.repeat_max,
+            pauseRangeMin: info.settings.pause_min,
+            pauseRangeMax: info.settings.pause_max,
+            volumeVariation: info.settings.volume_variation,
+          });
+        }
+        
+        set({ activeSounds: newActiveSounds });
+      }
+    } catch (error) {
+      console.warn('Failed to sync active ambients from backend:', error);
     }
   },
   

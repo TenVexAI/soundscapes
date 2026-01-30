@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { ChevronDown, ChevronRight, ChevronsUpDown, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw, Save, XCircle } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronsUpDown, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw, Save, XCircle, FilePlus } from 'lucide-react';
 import { useAmbientStore } from '../../stores/ambientStore';
 import { usePresetStore } from '../../stores/presetStore';
 import { AmbientSoundDef, AmbientSound, DEFAULT_AMBIENT_SETTINGS } from '../../types';
@@ -326,6 +326,7 @@ export const AmbientSoundscapes: React.FC = () => {
     deselectAllInCategory,
     setHideUnselected,
     clearAll,
+    syncActiveFromBackend,
   } = useAmbientStore();
 
   const {
@@ -408,6 +409,13 @@ export const AmbientSoundscapes: React.FC = () => {
   useEffect(() => {
     loadPresets();
   }, [loadPresets]);
+
+  // Sync active sounds from backend when window opens (restores UI state)
+  useEffect(() => {
+    if (categories.length > 0) {
+      syncActiveFromBackend();
+    }
+  }, [categories, syncActiveFromBackend]);
 
   // Check if preset name already exists
   const getExistingPresetByName = (name: string) => {
@@ -617,7 +625,7 @@ export const AmbientSoundscapes: React.FC = () => {
           className="px-2 py-1 rounded-lg text-xs text-text-secondary hover:text-accent-green hover:bg-bg-secondary transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-border"
           title="Save as new preset"
         >
-          + New
+          <FilePlus size={16} />
         </button>
         
         {currentPresetId && (

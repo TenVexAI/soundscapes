@@ -176,7 +176,7 @@ struct SoundboardMetadata {
 }
 
 // Ambient sound settings matching the spec
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 struct AmbientSettings {
     volume: f32,           // 0.0 - 1.0
     pitch: f32,            // 0.5 - 2.0 (playback speed)
@@ -232,6 +232,15 @@ enum AudioCommand {
     SetAmbientMasterVolume(f32),
     SetAmbientMuted(bool),
     PreloadAmbient(Vec<String>), // Preload audio files into memory cache
+}
+
+// Shared state for tracking active ambient sounds (queryable from outside audio thread)
+#[derive(Clone, Serialize)]
+struct ActiveAmbientInfo {
+    id: String,
+    file_a: String,
+    file_b: String,
+    settings: AmbientSettings,
 }
 
 // Shared state for progress tracking (this is Send + Sync)
@@ -662,6 +671,7 @@ struct AudioController {
     progress: Arc<Mutex<AudioProgress>>,
     playback_state: Arc<Mutex<PlaybackState>>,
     sample_buffer: Arc<FftSampleBuffer>,
+    active_ambients: Arc<Mutex<HashMap<String, ActiveAmbientInfo>>>,
 }
 
 impl AudioController {
@@ -675,10 +685,12 @@ impl AudioController {
         }));
         let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
         let sample_buffer = Arc::new(FftSampleBuffer::new());
+        let active_ambients = Arc::new(Mutex::new(HashMap::new()));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
         let sample_buffer_clone = sample_buffer.clone();
+        let active_ambients_clone = active_ambients.clone();
         
         // Spawn audio thread
         thread::spawn(move || {
@@ -982,16 +994,27 @@ impl AudioController {
                                         let mut rng = rand::thread_rng();
                                         let loops = rng.gen_range(settings.repeat_min..=settings.repeat_max);
                                         
-                                        ambient_states.insert(id, AmbientState {
+                                        ambient_states.insert(id.clone(), AmbientState {
                                             sink,
-                                            file_a,
-                                            file_b,
-                                            settings,
+                                            file_a: file_a.clone(),
+                                            file_b: file_b.clone(),
+                                            settings: settings.clone(),
                                             is_playing_a: true,
                                             loops_remaining: loops,
                                             pause_remaining: 0.0,
                                             is_paused: false,
                                         });
+                                        
+                                        // Track in shared state for querying
+                                        {
+                                            let mut active = active_ambients_clone.lock();
+                                            active.insert(id.clone(), ActiveAmbientInfo {
+                                                id,
+                                                file_a,
+                                                file_b,
+                                                settings,
+                                            });
+                                        }
                                     }
                                     }
                                 }
@@ -1011,7 +1034,15 @@ impl AudioController {
                                 let low_pass_changed = (state.settings.low_pass_freq - settings.low_pass_freq).abs() > 1.0;
                                 let reverb_changed = (state.settings.algorithmic_reverb - settings.algorithmic_reverb).abs() > 0.001
                                     || state.settings.reverb_type != settings.reverb_type;
-                                state.settings = settings;
+                                state.settings = settings.clone();
+                                
+                                // Update shared state with new settings
+                                {
+                                    let mut active = active_ambients_clone.lock();
+                                    if let Some(info) = active.get_mut(&id) {
+                                        info.settings = settings;
+                                    }
+                                }
                                 
                                 // If pitch, pan, low-pass, or reverb changed, restart current file with new settings
                                 if pitch_changed || pan_changed || low_pass_changed || reverb_changed {
@@ -1116,6 +1147,11 @@ impl AudioController {
                             fading_out.remove(&id);
                             if let Some(state) = ambient_states.remove(&id) {
                                 state.sink.stop();
+                            }
+                            // Remove from shared state
+                            {
+                                let mut active = active_ambients_clone.lock();
+                                active.remove(&id);
                             }
                         }
                         
@@ -1267,7 +1303,7 @@ impl AudioController {
             }
         });
         
-        Self { command_tx, progress, playback_state, sample_buffer }
+        Self { command_tx, progress, playback_state, sample_buffer, active_ambients }
     }
     
     fn send(&self, cmd: AudioCommand) {
@@ -1548,6 +1584,14 @@ fn get_playback_state(state: tauri::State<Arc<AudioController>>) -> Result<Playb
 }
 
 // Ambient sound commands
+#[tauri::command]
+fn get_active_ambients(
+    state: tauri::State<Arc<AudioController>>,
+) -> Result<Vec<ActiveAmbientInfo>, String> {
+    let active = state.active_ambients.lock();
+    Ok(active.values().cloned().collect())
+}
+
 #[tauri::command]
 fn preload_ambient_sounds(
     state: tauri::State<Arc<AudioController>>,
@@ -1837,6 +1881,7 @@ pub fn run() {
             set_master_muted,
             get_music_progress,
             get_playback_state,
+            get_active_ambients,
             preload_ambient_sounds,
             play_ambient,
             stop_ambient,
