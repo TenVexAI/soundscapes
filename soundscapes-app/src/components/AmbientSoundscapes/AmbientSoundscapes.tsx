@@ -1,7 +1,8 @@
-import React, { useState, useCallback } from 'react';
-import { ChevronDown, ChevronRight, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw } from 'lucide-react';
+import React, { useState, useCallback, useEffect } from 'react';
+import { ChevronDown, ChevronRight, ChevronsUpDown, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw, Save, XCircle } from 'lucide-react';
 import { useAmbientStore } from '../../stores/ambientStore';
-import { AmbientSoundDef } from '../../types';
+import { usePresetStore } from '../../stores/presetStore';
+import { AmbientSoundDef, AmbientSound, DEFAULT_AMBIENT_SETTINGS } from '../../types';
 
 // Info descriptions for each setting
 const settingInfo: Record<string, string> = {
@@ -47,13 +48,14 @@ interface SliderProps {
   onChange: (value: number) => void;
   formatValue: (value: number) => string;
   info?: string;
+  disabled?: boolean;
 }
 
-const Slider: React.FC<SliderProps> = ({ label, value, min, max, step = 1, onChange, formatValue, info }) => {
+const Slider: React.FC<SliderProps> = ({ label, value, min, max, step = 1, onChange, formatValue, info, disabled = false }) => {
   const percent = ((value - min) / (max - min)) * 100;
   
   return (
-    <div>
+    <div className={disabled ? 'opacity-50' : ''}>
       <div className="flex items-center justify-between text-xs mb-1.5">
         <div className="flex items-center gap-1">
           <span className="text-text-secondary">{label}</span>
@@ -63,15 +65,16 @@ const Slider: React.FC<SliderProps> = ({ label, value, min, max, step = 1, onCha
       </div>
       <div style={{ position: 'relative', height: '24px' }}>
         <div style={{ position: 'absolute', top: '8px', left: 0, right: 0, height: '8px', borderRadius: '4px', backgroundColor: '#313131' }} />
-        <div style={{ position: 'absolute', top: '8px', left: 0, height: '8px', borderRadius: '4px', background: 'linear-gradient(to right, #12e6c8, #a287f4)', width: `${percent}%` }} />
+        <div style={{ position: 'absolute', top: '8px', left: 0, height: '8px', borderRadius: '4px', background: disabled ? '#666' : 'linear-gradient(to right, #12e6c8, #a287f4)', width: `${percent}%` }} />
         <input
           type="range"
           min={min}
           max={max}
           step={step}
           value={value}
-          onChange={(e) => onChange(Number(e.target.value))}
-          style={{ position: 'relative', width: '100%', height: '24px', background: 'transparent', cursor: 'pointer' }}
+          onChange={(e) => !disabled && onChange(Number(e.target.value))}
+          disabled={disabled}
+          style={{ position: 'relative', width: '100%', height: '24px', background: 'transparent', cursor: disabled ? 'not-allowed' : 'pointer' }}
         />
       </div>
     </div>
@@ -157,11 +160,15 @@ interface SoundItemProps {
   onToggle: () => void;
   onUpdateSettings: (settings: Record<string, number | string>) => void;
   onResetToDefaults: () => void;
+  isExpanded: boolean;
+  onToggleExpanded: () => void;
   activeSettings?: {
     volume: number;
     pitch: number;
     pan: number;
     lowPassFreq: number;
+    reverbType: 'off' | 'small-room' | 'large-hall' | 'cathedral';
+    algorithmicReverb: number;
     repeatRangeMin: number;
     repeatRangeMax: number;
     pauseRangeMin: number;
@@ -176,9 +183,10 @@ const SoundItem: React.FC<SoundItemProps> = ({
   onToggle,
   onUpdateSettings,
   onResetToDefaults,
+  isExpanded,
+  onToggleExpanded,
   activeSettings,
 }) => {
-  const [isExpanded, setIsExpanded] = useState(false);
 
   return (
     <div className="rounded-lg bg-bg-secondary/30 overflow-hidden">
@@ -204,7 +212,7 @@ const SoundItem: React.FC<SoundItemProps> = ({
               <RotateCcw size={14} />
             </button>
             <button
-              onClick={() => setIsExpanded(!isExpanded)}
+              onClick={onToggleExpanded}
               className="p-1 text-text-secondary hover:text-text-primary transition-colors"
             >
               {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
@@ -257,6 +265,16 @@ const SoundItem: React.FC<SoundItemProps> = ({
           />
           
           <Slider
+            label="Reverb"
+            value={activeSettings.algorithmicReverb}
+            min={0}
+            max={100}
+            onChange={(v) => onUpdateSettings({ algorithmicReverb: v })}
+            formatValue={(v) => v === 0 ? 'Off' : `${v}%`}
+            info="Adds spacious reverb effect to the sound."
+          />
+          
+          <Slider
             label="Volume Variation"
             value={activeSettings.volumeVariation}
             min={0}
@@ -301,6 +319,7 @@ export const AmbientSoundscapes: React.FC = () => {
     expandedCategories,
     hideUnselected,
     toggleSound,
+    loadSoundWithSettings,
     updateSoundSettings,
     toggleCategory,
     selectAllInCategory,
@@ -309,29 +328,344 @@ export const AmbientSoundscapes: React.FC = () => {
     clearAll,
   } = useAmbientStore();
 
+  const {
+    presets,
+    currentPresetId,
+    loadPresets,
+    savePreset,
+    loadPreset,
+    deletePreset,
+    setCurrentPresetId,
+  } = usePresetStore();
+
+  const [showSaveNewDialog, setShowSaveNewDialog] = useState(false);
+  const [presetName, setPresetName] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [presetToDelete, setPresetToDelete] = useState<string | null>(null);
+  const [showOverwriteDialog, setShowOverwriteDialog] = useState(false);
+  const [showSaveCurrentDialog, setShowSaveCurrentDialog] = useState(false);
+  const [expandedSounds, setExpandedSounds] = useState<Set<string>>(new Set());
+
+  // Toggle a single sound's expanded state
+  const toggleSoundExpanded = (soundId: string) => {
+    setExpandedSounds(prev => {
+      const next = new Set(prev);
+      if (next.has(soundId)) {
+        next.delete(soundId);
+      } else {
+        next.add(soundId);
+      }
+      return next;
+    });
+  };
+
+  // Expand all active sounds
+  const expandAllSounds = () => {
+    const allActiveIds = Array.from(activeSounds.keys());
+    setExpandedSounds(new Set(allActiveIds));
+  };
+
+  // Collapse all sounds
+  const collapseAllSounds = () => {
+    setExpandedSounds(new Set());
+  };
+
+  // Check if all active sounds are expanded
+  const allSoundsExpanded = activeSounds.size > 0 && 
+    Array.from(activeSounds.keys()).every(id => expandedSounds.has(id));
+
+  // Expand all active sounds in a category
+  const expandAllInCategory = (categoryName: string) => {
+    const categorySounds = categories.find(c => c.name === categoryName)?.sounds || [];
+    const activeInCategory = categorySounds.filter(s => activeSounds.has(s.id)).map(s => s.id);
+    setExpandedSounds(prev => {
+      const next = new Set(prev);
+      activeInCategory.forEach(id => next.add(id));
+      return next;
+    });
+  };
+
+  // Collapse all sounds in a category
+  const collapseAllInCategory = (categoryName: string) => {
+    const categorySounds = categories.find(c => c.name === categoryName)?.sounds || [];
+    const idsInCategory = categorySounds.map(s => s.id);
+    setExpandedSounds(prev => {
+      const next = new Set(prev);
+      idsInCategory.forEach(id => next.delete(id));
+      return next;
+    });
+  };
+
+  // Check if all active sounds in a category are expanded
+  const allInCategoryExpanded = (categoryName: string) => {
+    const categorySounds = categories.find(c => c.name === categoryName)?.sounds || [];
+    const activeInCategory = categorySounds.filter(s => activeSounds.has(s.id));
+    return activeInCategory.length > 0 && activeInCategory.every(s => expandedSounds.has(s.id));
+  };
+
+  // Load presets on mount
+  useEffect(() => {
+    loadPresets();
+  }, [loadPresets]);
+
+  // Check if preset name already exists
+  const getExistingPresetByName = (name: string) => {
+    const normalizedName = name.trim().toLowerCase();
+    return presets.find(p => p.name.toLowerCase() === normalizedName);
+  };
+
+  // Get current preset name
+  const currentPresetName = currentPresetId 
+    ? presets.find(p => p.id === currentPresetId)?.name 
+    : null;
+
+  // Handle "Save New" - create a new preset
+  const handleSaveNew = async () => {
+    if (!presetName.trim() || activeSounds.size === 0) return;
+    
+    // Check if a preset with this name already exists
+    const existingPreset = getExistingPresetByName(presetName);
+    if (existingPreset) {
+      setShowOverwriteDialog(true);
+      return;
+    }
+    
+    await doSaveNewPreset();
+  };
+
+  // Actually save a new preset
+  const doSaveNewPreset = async () => {
+    setIsSaving(true);
+    try {
+      await savePreset(presetName.trim(), activeSounds);
+      setShowSaveNewDialog(false);
+      setPresetName('');
+      setShowOverwriteDialog(false);
+    } catch (error) {
+      console.error('Error saving preset:', error);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Handle confirming overwrite (for Save New with existing name)
+  const confirmOverwrite = async () => {
+    await doSaveNewPreset();
+  };
+
+  // Handle "Save Current" - overwrite the currently selected preset
+  const handleSaveCurrent = async () => {
+    if (!currentPresetId || !currentPresetName || activeSounds.size === 0) return;
+    
+    setIsSaving(true);
+    try {
+      await savePreset(currentPresetName, activeSounds);
+      setShowSaveCurrentDialog(false);
+    } catch (error) {
+      console.error('Error saving preset:', error);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Handle loading a preset
+  const handleLoadPreset = async (presetId: string) => {
+    try {
+      const preset = await loadPreset(presetId);
+      
+      // Clear existing sounds first
+      clearAll();
+      
+      // Small delay to let clearAll complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Load each sound from the preset sequentially with small delays to prevent audio glitches
+      for (let i = 0; i < preset.sounds.length; i++) {
+        const presetSound = preset.sounds[i];
+        // Create the sound object with preset settings
+        const sound: AmbientSound = {
+          id: presetSound.soundId,
+          name: presetSound.name,
+          categoryId: presetSound.categoryId,
+          categoryPath: presetSound.categoryPath,
+          filesA: presetSound.filesA,
+          filesB: presetSound.filesB,
+          enabled: presetSound.enabled,
+          volume: presetSound.volume,
+          pitch: presetSound.pitch,
+          pan: presetSound.pan,
+          lowPassFreq: presetSound.lowPassFreq,
+          reverbType: DEFAULT_AMBIENT_SETTINGS.reverbType,
+          algorithmicReverb: presetSound.algorithmicReverb,
+          repeatRangeMin: presetSound.repeatRangeMin,
+          repeatRangeMax: presetSound.repeatRangeMax,
+          pauseRangeMin: presetSound.pauseRangeMin,
+          pauseRangeMax: presetSound.pauseRangeMax,
+          volumeVariation: presetSound.volumeVariation,
+        };
+        
+        // Load the sound with all its settings in one operation
+        await loadSoundWithSettings(sound);
+        
+        // Small delay between sounds to prevent audio buffer overload
+        if (i < preset.sounds.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+      }
+    } catch (error) {
+      console.error('Error loading preset:', error);
+    }
+  };
+
+  // Handle deleting a preset
+  const handleDeletePreset = (presetId: string) => {
+    setPresetToDelete(presetId);
+    setShowDeleteDialog(true);
+  };
+
+  const confirmDeletePreset = async () => {
+    if (!presetToDelete) return;
+    
+    try {
+      await deletePreset(presetToDelete);
+    } catch (error) {
+      console.error('Error deleting preset:', error);
+    } finally {
+      setShowDeleteDialog(false);
+      setPresetToDelete(null);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
-      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
+      <div className="flex items-center justify-between border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
         <h2 className="text-lg font-semibold text-text-primary">Ambient Sounds</h2>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setHideUnselected(!hideUnselected)}
             className={`p-2 rounded-lg transition-colors ${
-              hideUnselected ? 'bg-accent-purple text-bg-primary' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+              hideUnselected ? 'text-accent-cyan' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
             }`}
             title={hideUnselected ? 'Show all sounds' : 'Hide unselected'}
           >
             {hideUnselected ? <Eye size={20} /> : <EyeOff size={20} />}
           </button>
           <button
-            onClick={clearAll}
+            onClick={() => allSoundsExpanded ? collapseAllSounds() : expandAllSounds()}
+            disabled={activeSounds.size === 0}
+            className={`p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+              allSoundsExpanded ? 'text-accent-purple' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+            }`}
+            title={allSoundsExpanded ? 'Collapse all settings' : 'Expand all settings'}
+          >
+            <ChevronsUpDown size={20} />
+          </button>
+          <button
+            onClick={() => {
+              clearAll();
+              setCurrentPresetId(null);
+            }}
             className="p-2 rounded-lg text-text-secondary hover:text-accent-red hover:bg-bg-secondary transition-colors"
             title="Clear all"
           >
-            <Trash2 size={20} />
+            <XCircle size={20} />
           </button>
         </div>
       </div>
+
+      {/* Preset Controls */}
+      <div className="flex items-center gap-2 border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
+        <select
+          value={currentPresetId || ''}
+          onChange={(e) => {
+            if (e.target.value) {
+              handleLoadPreset(e.target.value);
+            } else {
+              setCurrentPresetId(null);
+            }
+          }}
+          className="flex-1 px-2 py-1.5 bg-bg-secondary border border-border rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent-purple"
+        >
+          <option value="">Select Preset...</option>
+          {presets.map((preset) => (
+            <option key={preset.id} value={preset.id}>
+              {preset.name} ({preset.soundCount} sounds)
+            </option>
+          ))}
+        </select>
+        
+        {/* Save Current - only show when a preset is selected */}
+        {currentPresetId && (
+          <button
+            onClick={() => setShowSaveCurrentDialog(true)}
+            disabled={activeSounds.size === 0}
+            className="p-1.5 rounded-lg text-text-secondary hover:text-accent-blue hover:bg-bg-secondary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Update current preset"
+          >
+            <Save size={18} />
+          </button>
+        )}
+        
+        {/* Save New */}
+        <button
+          onClick={() => {
+            setPresetName('');
+            setShowSaveNewDialog(true);
+          }}
+          disabled={activeSounds.size === 0}
+          className="px-2 py-1 rounded-lg text-xs text-text-secondary hover:text-accent-green hover:bg-bg-secondary transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-border"
+          title="Save as new preset"
+        >
+          + New
+        </button>
+        
+        {currentPresetId && (
+          <button
+            onClick={() => handleDeletePreset(currentPresetId)}
+            className="p-1.5 rounded-lg text-text-secondary hover:text-accent-red hover:bg-bg-secondary transition-colors"
+            title="Delete preset"
+          >
+            <Trash2 size={18} />
+          </button>
+        )}
+      </div>
+
+      {/* Save New Preset Dialog */}
+      {showSaveNewDialog && (
+        <div className="mb-3 p-3 bg-bg-secondary rounded-lg border border-border">
+          <div className="flex items-center gap-2 mb-2">
+            <input
+              type="text"
+              value={presetName}
+              onChange={(e) => setPresetName(e.target.value)}
+              placeholder="New preset name..."
+              className="flex-1 px-2 py-1.5 bg-bg-primary border border-border rounded text-sm text-text-primary focus:outline-none focus:border-accent-purple"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveNew();
+                if (e.key === 'Escape') setShowSaveNewDialog(false);
+              }}
+            />
+            <button
+              onClick={handleSaveNew}
+              disabled={!presetName.trim() || isSaving}
+              className="px-3 py-1.5 bg-accent-green text-bg-primary rounded text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+            >
+              {isSaving ? '...' : 'Save'}
+            </button>
+            <button
+              onClick={() => setShowSaveNewDialog(false)}
+              className="p-1.5 text-text-secondary hover:text-text-primary transition-colors"
+            >
+              <XCircle size={18} />
+            </button>
+          </div>
+          <p className="text-xs text-text-secondary">
+            Create new preset with {activeSounds.size} sound{activeSounds.size !== 1 ? 's' : ''}
+          </p>
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto" style={{ paddingRight: '4px' }}>
         {categories.map((category) => {
@@ -372,6 +706,18 @@ export const AmbientSoundscapes: React.FC = () => {
                     >
                       Select None
                     </button>
+                    <button
+                      onClick={() => allInCategoryExpanded(category.name) 
+                        ? collapseAllInCategory(category.name) 
+                        : expandAllInCategory(category.name)}
+                      disabled={activeCount === 0}
+                      className={`text-xs px-2 py-1 rounded bg-bg-secondary transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                        allInCategoryExpanded(category.name) ? 'text-accent-purple' : 'text-text-secondary hover:text-text-primary'
+                      }`}
+                      title={allInCategoryExpanded(category.name) ? 'Collapse all settings' : 'Expand all settings'}
+                    >
+                      <ChevronsUpDown size={14} className="inline" />
+                    </button>
                   </div>
                   
                   <div className="space-y-1">
@@ -390,11 +736,15 @@ export const AmbientSoundscapes: React.FC = () => {
                             onToggle={() => toggleSound(category.path, sound, category.name)}
                             onUpdateSettings={(settings) => updateSoundSettings(sound.id, settings)}
                             onResetToDefaults={() => resetSoundToDefaults(sound.id, sound)}
+                            isExpanded={expandedSounds.has(sound.id)}
+                            onToggleExpanded={() => toggleSoundExpanded(sound.id)}
                             activeSettings={activeSound ? {
                               volume: activeSound.volume,
                               pitch: activeSound.pitch,
                               pan: activeSound.pan,
                               lowPassFreq: activeSound.lowPassFreq,
+                              reverbType: activeSound.reverbType,
+                              algorithmicReverb: activeSound.algorithmicReverb,
                               repeatRangeMin: activeSound.repeatRangeMin,
                               repeatRangeMax: activeSound.repeatRangeMax,
                               pauseRangeMin: activeSound.pauseRangeMin,
@@ -419,6 +769,111 @@ export const AmbientSoundscapes: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Delete Preset Confirmation Dialog */}
+      {showDeleteDialog && (
+        <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm rounded-xl">
+          <div 
+            className="bg-bg-primary rounded-xl border border-border/50 shadow-2xl"
+            style={{ padding: '24px', minWidth: '280px', maxWidth: '340px' }}
+          >
+            <h3 className="text-lg font-semibold text-text-primary" style={{ marginBottom: '8px' }}>
+              Delete Preset?
+            </h3>
+            <p className="text-text-secondary text-sm" style={{ marginBottom: '24px' }}>
+              Are you sure you want to delete this preset? This cannot be undone.
+            </p>
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button
+                onClick={() => {
+                  setShowDeleteDialog(false);
+                  setPresetToDelete(null);
+                }}
+                className="flex-1 rounded-lg bg-bg-secondary text-text-secondary hover:text-text-primary hover:bg-bg-secondary/80 transition-all"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeletePreset}
+                className="flex-1 rounded-lg bg-accent-red text-white hover:opacity-90 transition-all"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Overwrite Preset Confirmation Dialog (for Save New with existing name) */}
+      {showOverwriteDialog && (
+        <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm rounded-xl">
+          <div 
+            className="bg-bg-primary rounded-xl border border-border/50 shadow-2xl"
+            style={{ padding: '24px', minWidth: '280px', maxWidth: '340px' }}
+          >
+            <h3 className="text-lg font-semibold text-text-primary" style={{ marginBottom: '8px' }}>
+              Overwrite Preset?
+            </h3>
+            <p className="text-text-secondary text-sm" style={{ marginBottom: '24px' }}>
+              A preset named "{presetName}" already exists. Do you want to replace it?
+            </p>
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button
+                onClick={() => {
+                  setShowOverwriteDialog(false);
+                }}
+                className="flex-1 rounded-lg bg-bg-secondary text-text-secondary hover:text-text-primary hover:bg-bg-secondary/80 transition-all"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmOverwrite}
+                className="flex-1 rounded-lg bg-accent-orange text-white hover:opacity-90 transition-all"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                Overwrite
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Save Current Preset Confirmation Dialog */}
+      {showSaveCurrentDialog && (
+        <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm rounded-xl">
+          <div 
+            className="bg-bg-primary rounded-xl border border-border/50 shadow-2xl"
+            style={{ padding: '24px', minWidth: '280px', maxWidth: '340px' }}
+          >
+            <h3 className="text-lg font-semibold text-text-primary" style={{ marginBottom: '8px' }}>
+              Update Preset?
+            </h3>
+            <p className="text-text-secondary text-sm" style={{ marginBottom: '24px' }}>
+              This will update "<span className="text-text-primary font-medium">{currentPresetName}</span>" with your current {activeSounds.size} sound{activeSounds.size !== 1 ? 's' : ''} and settings.
+            </p>
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button
+                onClick={() => setShowSaveCurrentDialog(false)}
+                className="flex-1 rounded-lg bg-bg-secondary text-text-secondary hover:text-text-primary hover:bg-bg-secondary/80 transition-all"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveCurrent}
+                disabled={isSaving}
+                className="flex-1 rounded-lg bg-accent-blue text-white hover:opacity-90 transition-all disabled:opacity-50"
+                style={{ padding: '10px 14px', fontWeight: 500 }}
+              >
+                {isSaving ? 'Saving...' : 'Update'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

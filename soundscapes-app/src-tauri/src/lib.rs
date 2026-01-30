@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor, Read};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -92,6 +93,59 @@ pub struct SoundboardData {
     pub path: String,
 }
 
+// Soundscape preset types
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PresetSound {
+    #[serde(rename = "categoryId")]
+    pub category_id: String,
+    #[serde(rename = "categoryPath")]
+    pub category_path: String,
+    #[serde(rename = "soundId")]
+    pub sound_id: String,
+    pub name: String,
+    #[serde(rename = "filesA")]
+    pub files_a: String,
+    #[serde(rename = "filesB")]
+    pub files_b: String,
+    pub enabled: bool,
+    pub volume: u32,
+    pub pitch: f32,
+    pub pan: i32,
+    #[serde(rename = "lowPassFreq")]
+    pub low_pass_freq: u32,
+    #[serde(rename = "algorithmicReverb")]
+    pub algorithmic_reverb: u32,
+    #[serde(rename = "repeatRangeMin")]
+    pub repeat_range_min: u32,
+    #[serde(rename = "repeatRangeMax")]
+    pub repeat_range_max: u32,
+    #[serde(rename = "pauseRangeMin")]
+    pub pause_range_min: u32,
+    #[serde(rename = "pauseRangeMax")]
+    pub pause_range_max: u32,
+    #[serde(rename = "volumeVariation")]
+    pub volume_variation: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SoundscapePreset {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub modified: String,
+    pub sounds: Vec<PresetSound>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PresetInfo {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub modified: String,
+    #[serde(rename = "soundCount")]
+    pub sound_count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub music_folder_path: String,
@@ -127,6 +181,9 @@ struct AmbientSettings {
     volume: f32,           // 0.0 - 1.0
     pitch: f32,            // 0.5 - 2.0 (playback speed)
     pan: f32,              // -1.0 to 1.0 (L/R)
+    low_pass_freq: f32,    // 20 - 22000 Hz (cutoff frequency)
+    reverb_type: String,   // "off", "small-room", "large-hall", "cathedral"
+    algorithmic_reverb: f32, // 0.0 - 1.0 (only used when reverb_type is "off")
     repeat_min: u32,       // Min A/B cycles before pause
     repeat_max: u32,       // Max A/B cycles before pause
     pause_min: u32,        // Min pause cycles
@@ -140,6 +197,9 @@ impl Default for AmbientSettings {
             volume: 1.0,
             pitch: 1.0,
             pan: 0.0,
+            low_pass_freq: 22000.0, // Effectively off (above human hearing)
+            reverb_type: "off".to_string(),
+            algorithmic_reverb: 0.0,
             repeat_min: 1,
             repeat_max: 1,
             pause_min: 0,
@@ -171,6 +231,7 @@ enum AudioCommand {
     UpdateAmbientSettings { id: String, settings: AmbientSettings },
     SetAmbientMasterVolume(f32),
     SetAmbientMuted(bool),
+    PreloadAmbient(Vec<String>), // Preload audio files into memory cache
 }
 
 // Shared state for progress tracking (this is Send + Sync)
@@ -375,6 +436,227 @@ where
     }
 }
 
+// Source wrapper for low-pass filter (simple one-pole IIR filter)
+// cutoff_freq: 20 - 22000 Hz
+struct LowPassSource<S> {
+    inner: S,
+    alpha: f32,
+    prev_samples: Vec<f32>, // One per channel
+    channels: u16,
+    current_channel: u16,
+}
+
+impl<S> LowPassSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(inner: S, cutoff_freq: f32, sample_rate: u32) -> Self {
+        let channels = inner.channels();
+        // Calculate filter coefficient using RC time constant approximation
+        // alpha = dt / (RC + dt) where RC = 1 / (2 * pi * cutoff)
+        let dt = 1.0 / sample_rate as f32;
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_freq.clamp(20.0, 22000.0));
+        let alpha = dt / (rc + dt);
+        
+        Self {
+            inner,
+            alpha,
+            prev_samples: vec![0.0; channels as usize],
+            channels,
+            current_channel: 0,
+        }
+    }
+}
+
+impl<S> Iterator for LowPassSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        let ch = self.current_channel as usize;
+        self.current_channel = (self.current_channel + 1) % self.channels;
+        
+        // One-pole low-pass: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+        let filtered = self.alpha * sample + (1.0 - self.alpha) * self.prev_samples[ch];
+        self.prev_samples[ch] = filtered;
+        
+        Some(filtered)
+    }
+}
+
+impl<S> Source for LowPassSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
+// Source wrapper for algorithmic reverb (Schroeder-style with comb filters)
+// mix: 0.0 = dry only, 1.0 = full wet
+struct ReverbSource<S> {
+    inner: S,
+    mix: f32,
+    channels: u16,
+    current_channel: u16,
+    // Delay lines for each channel (4 comb filters per channel)
+    comb_buffers: Vec<Vec<Vec<f32>>>, // [channel][comb_index][samples]
+    comb_positions: Vec<Vec<usize>>,   // [channel][comb_index]
+    // Allpass filters
+    allpass_buffers: Vec<Vec<Vec<f32>>>, // [channel][allpass_index][samples]
+    allpass_positions: Vec<Vec<usize>>,
+}
+
+impl<S> ReverbSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(inner: S, mix: f32, sample_rate: u32) -> Self {
+        let channels = inner.channels() as usize;
+        let mix = mix.clamp(0.0, 1.0);
+        
+        // Comb filter delay times in samples (long delays for very spacious/echo-y reverb)
+        let comb_delays: [usize; 4] = [
+            (0.0797 * sample_rate as f32) as usize, // ~80ms
+            (0.0903 * sample_rate as f32) as usize, // ~90ms
+            (0.1100 * sample_rate as f32) as usize, // ~110ms
+            (0.1277 * sample_rate as f32) as usize, // ~128ms
+        ];
+        
+        // Allpass filter delay times (longer for more diffusion)
+        let allpass_delays: [usize; 2] = [
+            (0.0220 * sample_rate as f32) as usize, // ~22ms
+            (0.0074 * sample_rate as f32) as usize, // ~7.4ms
+        ];
+        
+        let mut comb_buffers = Vec::with_capacity(channels);
+        let mut comb_positions = Vec::with_capacity(channels);
+        let mut allpass_buffers = Vec::with_capacity(channels);
+        let mut allpass_positions = Vec::with_capacity(channels);
+        
+        for _ in 0..channels {
+            let mut ch_comb_buffers = Vec::with_capacity(4);
+            let mut ch_comb_positions = Vec::with_capacity(4);
+            for &delay in &comb_delays {
+                ch_comb_buffers.push(vec![0.0; delay.max(1)]);
+                ch_comb_positions.push(0);
+            }
+            comb_buffers.push(ch_comb_buffers);
+            comb_positions.push(ch_comb_positions);
+            
+            let mut ch_allpass_buffers = Vec::with_capacity(2);
+            let mut ch_allpass_positions = Vec::with_capacity(2);
+            for &delay in &allpass_delays {
+                ch_allpass_buffers.push(vec![0.0; delay.max(1)]);
+                ch_allpass_positions.push(0);
+            }
+            allpass_buffers.push(ch_allpass_buffers);
+            allpass_positions.push(ch_allpass_positions);
+        }
+        
+        Self {
+            inner,
+            mix,
+            channels: channels as u16,
+            current_channel: 0,
+            comb_buffers,
+            comb_positions,
+            allpass_buffers,
+            allpass_positions,
+        }
+    }
+}
+
+impl<S> Iterator for ReverbSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        
+        // Skip processing if mix is 0
+        if self.mix < 0.001 {
+            self.current_channel = (self.current_channel + 1) % self.channels;
+            return Some(sample);
+        }
+        
+        let ch = self.current_channel as usize;
+        self.current_channel = (self.current_channel + 1) % self.channels;
+        
+        // Comb filter bank (parallel)
+        let feedback = 0.95; // Very high feedback for long echo-y decay
+        let mut comb_sum = 0.0;
+        
+        for i in 0..4 {
+            let buf = &mut self.comb_buffers[ch][i];
+            let pos = self.comb_positions[ch][i];
+            let delayed = buf[pos];
+            let new_val = sample + delayed * feedback;
+            buf[pos] = new_val;
+            self.comb_positions[ch][i] = (pos + 1) % buf.len();
+            comb_sum += delayed;
+        }
+        comb_sum *= 0.25; // Average the 4 comb outputs
+        
+        // Allpass filters (series)
+        let allpass_coeff = 0.7; // Higher coefficient for more diffusion
+        let mut allpass_out = comb_sum;
+        
+        for i in 0..2 {
+            let buf = &mut self.allpass_buffers[ch][i];
+            let pos = self.allpass_positions[ch][i];
+            let delayed = buf[pos];
+            let new_val = allpass_out + delayed * allpass_coeff;
+            allpass_out = delayed - allpass_coeff * new_val;
+            buf[pos] = new_val;
+            self.allpass_positions[ch][i] = (pos + 1) % buf.len();
+        }
+        
+        // Mix dry and wet - aggressive wet signal boost
+        let wet_gain = 2.5;
+        Some(sample * (1.0 - self.mix) + allpass_out * self.mix * wet_gain)
+    }
+}
+
+impl<S> Source for ReverbSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
 struct AudioController {
     command_tx: Sender<AudioCommand>,
     progress: Arc<Mutex<AudioProgress>>,
@@ -435,6 +717,13 @@ impl AudioController {
             let mut ambient_states: HashMap<String, AmbientState> = HashMap::new();
             let mut ambient_master_volume: f32 = 1.0;
             let mut is_ambient_muted = false;
+            
+            // Audio file cache - stores file bytes in memory to avoid disk I/O during playback
+            let mut audio_cache: HashMap<String, Vec<u8>> = HashMap::new();
+            
+            // Track sounds that are fading out before stop (id -> fade progress 0.0-1.0)
+            let mut fading_out: HashMap<String, f32> = HashMap::new();
+            const FADE_STEPS: f32 = 4.0; // ~200ms fade (4 steps × 50ms loop)
             
             // Helper to calculate effective volume with variation
             fn calc_ambient_volume(
@@ -660,54 +949,72 @@ impl AudioController {
                             // Create sink and start with file A
                             match Sink::try_new(&stream_handle) {
                                 Ok(sink) => {
-                                    // Load and play file A first
-                                    if let Ok(file) = File::open(&file_a) {
-                                        let reader = BufReader::new(file);
-                                        if let Ok(source) = Decoder::new(reader) {
-                                            // Apply pitch and pan
-                                            let source = source.speed(settings.pitch).convert_samples::<f32>();
-                                            let source = PannedSource::new(source, settings.pan);
-                                            
-                                            let effective_vol = calc_ambient_volume(
-                                                &settings, ambient_master_volume, master_volume,
-                                                is_ambient_muted, is_master_muted
-                                            );
-                                            sink.set_volume(effective_vol);
-                                            sink.append(source);
-                                            
-                                            // Determine initial loop count
-                                            let mut rng = rand::thread_rng();
-                                            let loops = rng.gen_range(settings.repeat_min..=settings.repeat_max);
-                                            
-                                            ambient_states.insert(id, AmbientState {
-                                                sink,
-                                                file_a,
-                                                file_b,
-                                                settings,
-                                                is_playing_a: true,
-                                                loops_remaining: loops,
-                                                pause_remaining: 0.0,
-                                                is_paused: false,
-                                            });
-                                        }
+                                    // Try to load from cache first, fall back to disk (read into memory)
+                                    let bytes = if let Some(cached_bytes) = audio_cache.get(&file_a) {
+                                        Some(cached_bytes.clone())
+                                    } else {
+                                        // Fall back to disk read into memory
+                                        File::open(&file_a).ok().and_then(|mut f| {
+                                            let mut bytes = Vec::new();
+                                            f.read_to_end(&mut bytes).ok().map(|_| bytes)
+                                        })
+                                    };
+                                    
+                                    if let Some(bytes) = bytes {
+                                    if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                        // Apply pitch, pan, low-pass filter
+                                        let sample_rate = source.sample_rate();
+                                        let source = source.speed(settings.pitch).convert_samples::<f32>();
+                                        let source = PannedSource::new(source, settings.pan);
+                                        let source = LowPassSource::new(source, settings.low_pass_freq, sample_rate);
+                                        
+                                        let effective_vol = calc_ambient_volume(
+                                            &settings, ambient_master_volume, master_volume,
+                                            is_ambient_muted, is_master_muted
+                                        );
+                                        sink.set_volume(effective_vol);
+                                        
+                                        // Apply reverb
+                                        let source = ReverbSource::new(source, settings.algorithmic_reverb, sample_rate);
+                                        sink.append(source);
+                                        
+                                        // Determine initial loop count
+                                        let mut rng = rand::thread_rng();
+                                        let loops = rng.gen_range(settings.repeat_min..=settings.repeat_max);
+                                        
+                                        ambient_states.insert(id, AmbientState {
+                                            sink,
+                                            file_a,
+                                            file_b,
+                                            settings,
+                                            is_playing_a: true,
+                                            loops_remaining: loops,
+                                            pause_remaining: 0.0,
+                                            is_paused: false,
+                                        });
+                                    }
                                     }
                                 }
                                 Err(e) => eprintln!("Failed to create ambient sink: {}", e),
                             }
                         }
                         AudioCommand::StopAmbient(id) => {
-                            if let Some(state) = ambient_states.remove(&id) {
-                                state.sink.stop();
+                            // Start fade-out instead of immediate stop
+                            if ambient_states.contains_key(&id) && !fading_out.contains_key(&id) {
+                                fading_out.insert(id, 0.0);
                             }
                         }
                         AudioCommand::UpdateAmbientSettings { id, settings } => {
                             if let Some(state) = ambient_states.get_mut(&id) {
                                 let pitch_changed = (state.settings.pitch - settings.pitch).abs() > 0.001;
                                 let pan_changed = (state.settings.pan - settings.pan).abs() > 0.001;
+                                let low_pass_changed = (state.settings.low_pass_freq - settings.low_pass_freq).abs() > 1.0;
+                                let reverb_changed = (state.settings.algorithmic_reverb - settings.algorithmic_reverb).abs() > 0.001
+                                    || state.settings.reverb_type != settings.reverb_type;
                                 state.settings = settings;
                                 
-                                // If pitch or pan changed, restart current file with new settings
-                                if pitch_changed || pan_changed {
+                                // If pitch, pan, low-pass, or reverb changed, restart current file with new settings
+                                if pitch_changed || pan_changed || low_pass_changed || reverb_changed {
                                     state.sink.stop();
                                     // Create new sink
                                     if let Ok(new_sink) = Sink::try_new(&stream_handle) {
@@ -716,19 +1023,30 @@ impl AudioController {
                                         } else {
                                             &state.file_b
                                         };
-                                        if let Ok(file) = File::open(file_path) {
-                                            let reader = BufReader::new(file);
-                                            if let Ok(source) = Decoder::new(reader) {
-                                                let source = source.speed(state.settings.pitch).convert_samples::<f32>();
-                                                let source = PannedSource::new(source, state.settings.pan);
-                                                let effective_vol = calc_ambient_volume(
-                                                    &state.settings, ambient_master_volume, master_volume,
-                                                    is_ambient_muted, is_master_muted
-                                                );
-                                                new_sink.set_volume(effective_vol);
-                                                new_sink.append(source);
-                                                state.sink = new_sink;
-                                            }
+                                        // Try cache first, fall back to disk read into memory
+                                        let bytes = if let Some(cached) = audio_cache.get(file_path) {
+                                            Some(cached.clone())
+                                        } else {
+                                            File::open(file_path).ok().and_then(|mut f| {
+                                                let mut b = Vec::new();
+                                                f.read_to_end(&mut b).ok().map(|_| b)
+                                            })
+                                        };
+                                        if let Some(bytes) = bytes {
+                                        if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                            let sample_rate = source.sample_rate();
+                                            let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                            let source = PannedSource::new(source, state.settings.pan);
+                                            let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
+                                            let effective_vol = calc_ambient_volume(
+                                                &state.settings, ambient_master_volume, master_volume,
+                                                is_ambient_muted, is_master_muted
+                                            );
+                                            new_sink.set_volume(effective_vol);
+                                            let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            new_sink.append(source);
+                                            state.sink = new_sink;
+                                        }
                                         }
                                     }
                                 } else {
@@ -761,8 +1079,46 @@ impl AudioController {
                                 state.sink.set_volume(effective_vol);
                             }
                         }
+                        AudioCommand::PreloadAmbient(paths) => {
+                            // Preload audio files into memory cache to avoid disk I/O during playback
+                            for path in paths {
+                                if !audio_cache.contains_key(&path) {
+                                    if let Ok(mut file) = File::open(&path) {
+                                        let mut bytes = Vec::new();
+                                        if file.read_to_end(&mut bytes).is_ok() {
+                                            audio_cache.insert(path, bytes);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     },
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Process fade-outs for sounds being stopped
+                        let mut completed_fades: Vec<String> = Vec::new();
+                        for (id, progress) in fading_out.iter_mut() {
+                            *progress += 1.0 / FADE_STEPS;
+                            if let Some(state) = ambient_states.get(id) {
+                                // Calculate faded volume (linear fade to 0)
+                                let fade_multiplier = (1.0 - *progress).max(0.0);
+                                let base_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted
+                                );
+                                state.sink.set_volume(base_vol * fade_multiplier);
+                            }
+                            if *progress >= 1.0 {
+                                completed_fades.push(id.clone());
+                            }
+                        }
+                        // Remove completed fades and stop their sinks
+                        for id in completed_fades {
+                            fading_out.remove(&id);
+                            if let Some(state) = ambient_states.remove(&id) {
+                                state.sink.stop();
+                            }
+                        }
+                        
                         // A/B crossfade state machine - check each ambient sound
                         let mut rng = rand::thread_rng();
                         for state in ambient_states.values_mut() {
@@ -778,36 +1134,56 @@ impl AudioController {
                                             state.settings.repeat_min..=state.settings.repeat_max
                                         );
                                         state.is_playing_a = true;
-                                        // Play A
-                                        if let Ok(file) = File::open(&state.file_a) {
-                                            let reader = BufReader::new(file);
-                                            if let Ok(source) = Decoder::new(reader) {
-                                                let source = source.speed(state.settings.pitch).convert_samples::<f32>();
-                                                let source = PannedSource::new(source, state.settings.pan);
-                                                let effective_vol = calc_ambient_volume(
-                                                    &state.settings, ambient_master_volume, master_volume,
-                                                    is_ambient_muted, is_master_muted
-                                                );
-                                                state.sink.set_volume(effective_vol);
-                                                state.sink.append(source);
-                                            }
-                                        }
-                                    }
-                                } else if state.is_playing_a {
-                                    // A finished, play B
-                                    state.is_playing_a = false;
-                                    if let Ok(file) = File::open(&state.file_b) {
-                                        let reader = BufReader::new(file);
-                                        if let Ok(source) = Decoder::new(reader) {
+                                        // Play A (try cache first)
+                                        let bytes = if let Some(cached) = audio_cache.get(&state.file_a) {
+                                            Some(cached.clone())
+                                        } else {
+                                            File::open(&state.file_a).ok().and_then(|mut f| {
+                                                let mut b = Vec::new();
+                                                f.read_to_end(&mut b).ok().map(|_| b)
+                                            })
+                                        };
+                                        if let Some(bytes) = bytes {
+                                        if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                            let sample_rate = source.sample_rate();
                                             let source = source.speed(state.settings.pitch).convert_samples::<f32>();
                                             let source = PannedSource::new(source, state.settings.pan);
+                                            let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                             let effective_vol = calc_ambient_volume(
                                                 &state.settings, ambient_master_volume, master_volume,
                                                 is_ambient_muted, is_master_muted
                                             );
                                             state.sink.set_volume(effective_vol);
+                                            let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
                                             state.sink.append(source);
                                         }
+                                        }
+                                    }
+                                } else if state.is_playing_a {
+                                    // A finished, play B (try cache first)
+                                    state.is_playing_a = false;
+                                    let bytes = if let Some(cached) = audio_cache.get(&state.file_b) {
+                                        Some(cached.clone())
+                                    } else {
+                                        File::open(&state.file_b).ok().and_then(|mut f| {
+                                            let mut b = Vec::new();
+                                            f.read_to_end(&mut b).ok().map(|_| b)
+                                        })
+                                    };
+                                    if let Some(bytes) = bytes {
+                                    if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                        let sample_rate = source.sample_rate();
+                                        let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                        let source = PannedSource::new(source, state.settings.pan);
+                                        let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
+                                        let effective_vol = calc_ambient_volume(
+                                            &state.settings, ambient_master_volume, master_volume,
+                                            is_ambient_muted, is_master_muted
+                                        );
+                                        state.sink.set_volume(effective_vol);
+                                        let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                        state.sink.append(source);
+                                    }
                                     }
                                 } else {
                                     // B finished, one A/B loop complete
@@ -828,35 +1204,55 @@ impl AudioController {
                                                 state.settings.repeat_min..=state.settings.repeat_max
                                             );
                                             state.is_playing_a = true;
-                                            if let Ok(file) = File::open(&state.file_a) {
-                                                let reader = BufReader::new(file);
-                                                if let Ok(source) = Decoder::new(reader) {
-                                                    let source = source.speed(state.settings.pitch).convert_samples::<f32>();
-                                                    let source = PannedSource::new(source, state.settings.pan);
-                                                    let effective_vol = calc_ambient_volume(
-                                                        &state.settings, ambient_master_volume, master_volume,
-                                                        is_ambient_muted, is_master_muted
-                                                    );
-                                                    state.sink.set_volume(effective_vol);
-                                                    state.sink.append(source);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // More loops to go, play A again
-                                        state.is_playing_a = true;
-                                        if let Ok(file) = File::open(&state.file_a) {
-                                            let reader = BufReader::new(file);
-                                            if let Ok(source) = Decoder::new(reader) {
+                                            let bytes = if let Some(cached) = audio_cache.get(&state.file_a) {
+                                                Some(cached.clone())
+                                            } else {
+                                                File::open(&state.file_a).ok().and_then(|mut f| {
+                                                    let mut b = Vec::new();
+                                                    f.read_to_end(&mut b).ok().map(|_| b)
+                                                })
+                                            };
+                                            if let Some(bytes) = bytes {
+                                            if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                                let sample_rate = source.sample_rate();
                                                 let source = source.speed(state.settings.pitch).convert_samples::<f32>();
                                                 let source = PannedSource::new(source, state.settings.pan);
+                                                let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                                 let effective_vol = calc_ambient_volume(
                                                     &state.settings, ambient_master_volume, master_volume,
                                                     is_ambient_muted, is_master_muted
                                                 );
                                                 state.sink.set_volume(effective_vol);
+                                                let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
                                                 state.sink.append(source);
                                             }
+                                            }
+                                        }
+                                    } else {
+                                        // More loops to go, play A again
+                                        state.is_playing_a = true;
+                                        let bytes = if let Some(cached) = audio_cache.get(&state.file_a) {
+                                            Some(cached.clone())
+                                        } else {
+                                            File::open(&state.file_a).ok().and_then(|mut f| {
+                                                let mut b = Vec::new();
+                                                f.read_to_end(&mut b).ok().map(|_| b)
+                                            })
+                                        };
+                                        if let Some(bytes) = bytes {
+                                        if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                            let sample_rate = source.sample_rate();
+                                            let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                            let source = PannedSource::new(source, state.settings.pan);
+                                            let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
+                                            let effective_vol = calc_ambient_volume(
+                                                &state.settings, ambient_master_volume, master_volume,
+                                                is_ambient_muted, is_master_muted
+                                            );
+                                            state.sink.set_volume(effective_vol);
+                                            let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            state.sink.append(source);
+                                        }
                                         }
                                     }
                                 }
@@ -1153,6 +1549,15 @@ fn get_playback_state(state: tauri::State<Arc<AudioController>>) -> Result<Playb
 
 // Ambient sound commands
 #[tauri::command]
+fn preload_ambient_sounds(
+    state: tauri::State<Arc<AudioController>>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    state.send(AudioCommand::PreloadAmbient(paths));
+    Ok(())
+}
+
+#[tauri::command]
 fn play_ambient(
     state: tauri::State<Arc<AudioController>>,
     id: String,
@@ -1161,6 +1566,9 @@ fn play_ambient(
     volume: f32,
     pitch: Option<f32>,
     pan: Option<f32>,
+    low_pass_freq: Option<f32>,
+    reverb_type: Option<String>,
+    algorithmic_reverb: Option<f32>,
     repeat_min: Option<u32>,
     repeat_max: Option<u32>,
     pause_min: Option<u32>,
@@ -1171,6 +1579,9 @@ fn play_ambient(
         volume,
         pitch: pitch.unwrap_or(1.0),
         pan: pan.unwrap_or(0.0),
+        low_pass_freq: low_pass_freq.unwrap_or(22000.0),
+        reverb_type: reverb_type.unwrap_or_else(|| "off".to_string()),
+        algorithmic_reverb: algorithmic_reverb.unwrap_or(0.0),
         repeat_min: repeat_min.unwrap_or(1),
         repeat_max: repeat_max.unwrap_or(1),
         pause_min: pause_min.unwrap_or(0),
@@ -1194,6 +1605,9 @@ fn update_ambient_settings(
     volume: f32,
     pitch: Option<f32>,
     pan: Option<f32>,
+    low_pass_freq: Option<f32>,
+    reverb_type: Option<String>,
+    algorithmic_reverb: Option<f32>,
     repeat_min: Option<u32>,
     repeat_max: Option<u32>,
     pause_min: Option<u32>,
@@ -1204,6 +1618,9 @@ fn update_ambient_settings(
         volume,
         pitch: pitch.unwrap_or(1.0),
         pan: pan.unwrap_or(0.0),
+        low_pass_freq: low_pass_freq.unwrap_or(22000.0),
+        reverb_type: reverb_type.unwrap_or_else(|| "off".to_string()),
+        algorithmic_reverb: algorithmic_reverb.unwrap_or(0.0),
         repeat_min: repeat_min.unwrap_or(1),
         repeat_max: repeat_max.unwrap_or(1),
         pause_min: pause_min.unwrap_or(0),
@@ -1223,6 +1640,136 @@ fn set_ambient_master_volume(state: tauri::State<Arc<AudioController>>, volume: 
 #[tauri::command]
 fn set_ambient_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> Result<(), String> {
     state.send(AudioCommand::SetAmbientMuted(muted));
+    Ok(())
+}
+
+// === Preset Management Commands ===
+
+fn get_presets_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let presets_dir = app_data.join("presets");
+    
+    if !presets_dir.exists() {
+        fs::create_dir_all(&presets_dir)
+            .map_err(|e| format!("Failed to create presets directory: {}", e))?;
+    }
+    
+    Ok(presets_dir)
+}
+
+#[tauri::command]
+fn list_presets(app: tauri::AppHandle) -> Result<Vec<PresetInfo>, String> {
+    let presets_dir = get_presets_dir(&app)?;
+    let mut presets = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(&presets_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map(|e| e == "soundscape").unwrap_or(false) {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(preset) = serde_json::from_str::<SoundscapePreset>(&content) {
+                        presets.push(PresetInfo {
+                            id: preset.id,
+                            name: preset.name,
+                            created: preset.created,
+                            modified: preset.modified,
+                            sound_count: preset.sounds.len(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort by name
+    presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    
+    Ok(presets)
+}
+
+#[tauri::command]
+fn save_preset(app: tauri::AppHandle, name: String, sounds: Vec<PresetSound>) -> Result<PresetInfo, String> {
+    let presets_dir = get_presets_dir(&app)?;
+    
+    // Generate ID from name (sanitized filename)
+    let id: String = name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    let preset_path = presets_dir.join(format!("{}.soundscape", &id));
+    
+    // Check if updating existing preset
+    let (created, id) = if preset_path.exists() {
+        if let Ok(content) = fs::read_to_string(&preset_path) {
+            if let Ok(existing) = serde_json::from_str::<SoundscapePreset>(&content) {
+                (existing.created, existing.id)
+            } else {
+                (now.clone(), id)
+            }
+        } else {
+            (now.clone(), id)
+        }
+    } else {
+        (now.clone(), id)
+    };
+    
+    let preset = SoundscapePreset {
+        id: id.clone(),
+        name: name.clone(),
+        created,
+        modified: now,
+        sounds: sounds.clone(),
+    };
+    
+    let content = serde_json::to_string_pretty(&preset)
+        .map_err(|e| format!("Failed to serialize preset: {}", e))?;
+    
+    fs::write(&preset_path, content)
+        .map_err(|e| format!("Failed to write preset file: {}", e))?;
+    
+    Ok(PresetInfo {
+        id: preset.id,
+        name: preset.name,
+        created: preset.created,
+        modified: preset.modified,
+        sound_count: preset.sounds.len(),
+    })
+}
+
+#[tauri::command]
+fn load_preset(app: tauri::AppHandle, id: String) -> Result<SoundscapePreset, String> {
+    let presets_dir = get_presets_dir(&app)?;
+    let preset_path = presets_dir.join(format!("{}.soundscape", &id));
+    
+    if !preset_path.exists() {
+        return Err(format!("Preset '{}' not found", id));
+    }
+    
+    let content = fs::read_to_string(&preset_path)
+        .map_err(|e| format!("Failed to read preset file: {}", e))?;
+    
+    let preset: SoundscapePreset = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse preset: {}", e))?;
+    
+    Ok(preset)
+}
+
+#[tauri::command]
+fn delete_preset(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let presets_dir = get_presets_dir(&app)?;
+    let preset_path = presets_dir.join(format!("{}.soundscape", &id));
+    
+    if !preset_path.exists() {
+        return Err(format!("Preset '{}' not found", id));
+    }
+    
+    fs::remove_file(&preset_path)
+        .map_err(|e| format!("Failed to delete preset: {}", e))?;
+    
     Ok(())
 }
 
@@ -1290,12 +1837,17 @@ pub fn run() {
             set_master_muted,
             get_music_progress,
             get_playback_state,
+            preload_ambient_sounds,
             play_ambient,
             stop_ambient,
             update_ambient_settings,
             set_ambient_master_volume,
             set_ambient_muted,
-            get_output_devices
+            get_output_devices,
+            list_presets,
+            save_preset,
+            load_preset,
+            delete_preset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
