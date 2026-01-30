@@ -3,10 +3,19 @@ import { Music, Waves, Grid3X3, Settings, Power } from 'lucide-react';
 import { useWindowStore, WindowType } from '../../stores/windowStore';
 import { exit } from '@tauri-apps/plugin-process';
 
+// Active colors per window type
+const activeColors: Record<WindowType, string> = {
+  settings: 'text-accent-green',
+  music: 'text-accent-cyan',
+  ambient: 'text-accent-purple',
+  soundboard: 'text-accent-red',
+};
+
 interface SidebarButtonProps {
   icon: React.ReactNode;
   isOpen: boolean;
   isHovered: boolean;
+  windowType: WindowType;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
   onClick: () => void;
@@ -17,15 +26,18 @@ const SidebarButton: React.FC<SidebarButtonProps> = ({
   icon, 
   isOpen, 
   isHovered,
+  windowType,
   onMouseEnter,
   onMouseLeave,
   onClick, 
   title 
 }) => {
-  // Color logic: white when closed, cyan when open, red on hover when open (to close)
+  // Color logic: white when closed, window-specific color when open, red on hover when open (to close)
+  // Soundboard uses grey on hover since its active color is already red
   let colorClass = 'text-text-secondary hover:text-text-primary'; // closed
   if (isOpen) {
-    colorClass = isHovered ? 'text-accent-red' : 'text-accent-cyan';
+    const hoverColor = windowType === 'soundboard' ? 'text-text-secondary' : 'text-accent-red';
+    colorClass = isHovered ? hoverColor : activeColors[windowType];
   }
   
   return (
@@ -97,10 +109,10 @@ export const Sidebar: React.FC = () => {
   };
 
   const buttons: { type: WindowType; icon: React.ReactNode; title: string }[] = [
+    { type: 'settings', icon: <Settings size={22} />, title: 'Settings' },
     { type: 'music', icon: <Music size={22} />, title: 'Music Playlist' },
     { type: 'ambient', icon: <Waves size={22} />, title: 'Ambient Soundscapes' },
     { type: 'soundboard', icon: <Grid3X3 size={22} />, title: 'Soundboard' },
-    { type: 'settings', icon: <Settings size={22} />, title: 'Settings' },
   ];
 
   return (
@@ -111,6 +123,7 @@ export const Sidebar: React.FC = () => {
             <SidebarButton
               key={type}
               icon={icon}
+              windowType={type}
               isOpen={openWindows.has(type)}
               isHovered={hoveredButton === type}
               onMouseEnter={() => setHoveredButton(type)}

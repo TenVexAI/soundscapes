@@ -41,6 +41,8 @@ export const useWindowStore = create<WindowState>((set, get) => ({
         title: config.title,
         width: config.width,
         height: config.height,
+        minWidth: 350,
+        minHeight: 450,
         resizable: true,
         decorations: true,
         center: true,

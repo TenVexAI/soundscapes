@@ -1,41 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { AudioWaveform } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
 import { NowPlaying } from './NowPlaying';
 import { VolumeControls } from './VolumeControls';
 import { getVisualizationList } from '../../visualizations';
+import { useSettingsStore } from '../../stores/settingsStore';
 
 export const MainWindow: React.FC = () => {
-  const [currentVizId, setCurrentVizId] = useState<string>('orb');
+  const { settings, updateSetting } = useSettingsStore();
   const vizList = getVisualizationList();
+  const currentVizId = settings?.visualization_type || 'orb';
 
-  // Poll current visualization from backend
-  useEffect(() => {
-    let mounted = true;
-    const poll = async () => {
-      if (!mounted) return;
-      try {
-        const settings = await invoke<{ visualization_type?: string }>('get_settings');
-        if (settings?.visualization_type) {
-          setCurrentVizId(settings.visualization_type);
-        }
-      } catch { /* ignore polling errors */ }
-      if (mounted) setTimeout(poll, 500);
-    };
-    poll();
-    return () => { mounted = false; };
-  }, []);
-
-  const cycleVisualization = async () => {
+  const cycleVisualization = () => {
     const currentIndex = vizList.findIndex(v => v.id === currentVizId);
     const nextIndex = (currentIndex + 1) % vizList.length;
     const nextVizId = vizList[nextIndex].id;
-    setCurrentVizId(nextVizId);
-    try {
-      await invoke('update_setting', { key: 'visualization_type', value: nextVizId });
-    } catch (err) {
-      console.error('Failed to update visualization:', err);
-    }
+    updateSetting('visualization_type', nextVizId);
   };
 
   return (

@@ -26,10 +26,10 @@ interface AudioState {
 }
 
 export const useAudioStore = create<AudioState>((set, get) => ({
-  masterVolume: 100,
-  musicVolume: 100,
-  ambientVolume: 100,
-  soundboardVolume: 100,
+  masterVolume: 50,
+  musicVolume: 50,
+  ambientVolume: 50,
+  soundboardVolume: 50,
   
   isMasterMuted: false,
   isMusicMuted: false,
