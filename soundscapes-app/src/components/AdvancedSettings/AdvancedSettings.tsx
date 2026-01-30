@@ -83,6 +83,13 @@ export const AdvancedSettings: React.FC = () => {
     loadDevices();
   }, []);
 
+  // Sync crossfade duration to backend when settings load
+  useEffect(() => {
+    if (settings?.music_crossfade_duration !== undefined) {
+      invoke('set_crossfade_duration', { duration: settings.music_crossfade_duration });
+    }
+  }, [settings?.music_crossfade_duration]);
+
   if (!settings) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -191,7 +198,11 @@ export const AdvancedSettings: React.FC = () => {
                   max="10"
                   step="0.5"
                   value={settings.music_crossfade_duration}
-                  onChange={(e) => updateSetting('music_crossfade_duration', Number(e.target.value))}
+                  onChange={(e) => {
+                    const duration = Number(e.target.value);
+                    updateSetting('music_crossfade_duration', duration);
+                    invoke('set_crossfade_duration', { duration });
+                  }}
                   style={{ position: 'relative', width: '100%', height: '24px', background: 'transparent', cursor: 'pointer' }}
                 />
               </div>

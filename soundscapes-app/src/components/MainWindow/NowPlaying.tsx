@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Music } from 'lucide-react';
-import { usePlaylistStore } from '../../stores/playlistStore';
+import { Play, Pause, SkipBack, SkipForward } from 'lucide-react';
 import { useAudioStore } from '../../stores/audioStore';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -11,29 +10,87 @@ interface MusicProgress {
   is_finished: boolean;
 }
 
+interface CurrentTrackInfo {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  file_path: string;
+}
+
 export const NowPlaying: React.FC = () => {
-  const { currentTrack, isPlaying, togglePlayPause, playNext, playPrevious } = usePlaylistStore();
   const { isMusicMuted } = useAudioStore();
+  const [currentTrack, setCurrentTrack] = useState<CurrentTrackInfo | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState({ currentTime: 0, duration: 0 });
 
+  // Poll for current track and progress from backend
   useEffect(() => {
-    if (!currentTrack) return;
+    let mounted = true;
     
-    const interval = setInterval(async () => {
+    const poll = async () => {
+      if (!mounted) return;
       try {
-        const prog = await invoke<MusicProgress>('get_music_progress');
-        setProgress({ currentTime: prog.current_time, duration: prog.duration });
+        const [trackInfo, prog] = await Promise.all([
+          invoke<CurrentTrackInfo | null>('get_current_track'),
+          invoke<MusicProgress>('get_music_progress'),
+        ]);
         
-        if (prog.is_finished && isPlaying) {
-          playNext();
+        if (mounted) {
+          setCurrentTrack(trackInfo);
+          setIsPlaying(prog.is_playing);
+          setProgress({ currentTime: prog.current_time, duration: prog.duration });
         }
-      } catch (error) {
-        console.error('Error getting progress:', error);
+      } catch {
+        // Ignore errors during polling
       }
-    }, 250);
+      
+      if (mounted) {
+        setTimeout(poll, 250);
+      }
+    };
     
-    return () => clearInterval(interval);
-  }, [currentTrack, isPlaying, playNext]);
+    poll();
+    return () => { mounted = false; };
+  }, []);
+
+  const togglePlayPause = async () => {
+    try {
+      if (isPlaying) {
+        await invoke('pause_music');
+      } else {
+        await invoke('resume_music');
+      }
+    } catch (err) {
+      console.error('Error toggling play/pause:', err);
+    }
+  };
+
+  const playNext = async () => {
+    try {
+      // Skip to next track by stopping current and letting playlist auto-advance
+      await invoke('stop_music');
+    } catch (err) {
+      console.error('Error skipping track:', err);
+    }
+  };
+
+  const restartTrack = async () => {
+    // Restart current track from beginning by re-playing it
+    if (currentTrack) {
+      try {
+        await invoke('play_music', {
+          filePath: currentTrack.file_path,
+          id: currentTrack.id,
+          title: currentTrack.title,
+          artist: currentTrack.artist,
+          album: currentTrack.album,
+        });
+      } catch (err) {
+        console.error('Error restarting track:', err);
+      }
+    }
+  };
 
   const progressPercent = progress.duration > 0 
     ? (progress.currentTime / progress.duration) * 100 
@@ -45,13 +102,8 @@ export const NowPlaying: React.FC = () => {
       <div className="absolute inset-0 bg-gradient-to-r from-accent-purple/5 to-accent-cyan/5 pointer-events-none" />
       
       <div className="relative flex items-center gap-4" style={{ padding: '12px' }}>
-        {/* Album art placeholder */}
-        <div className="w-12 h-12 bg-gradient-to-br from-accent-purple/20 to-accent-cyan/20 rounded-lg flex items-center justify-center flex-shrink-0">
-          <Music size={24} className="text-accent-purple" />
-        </div>
-        
         {/* Track info */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 select-none">
           {currentTrack ? (
             <>
               <h3 className="text-sm font-semibold text-text-primary truncate">
@@ -76,25 +128,42 @@ export const NowPlaying: React.FC = () => {
         {/* Playback controls */}
         <div className="flex items-center gap-1">
           <button
-            onClick={playPrevious}
-            className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/5 transition-all"
-            title="Previous"
+            onClick={restartTrack}
+            disabled={!currentTrack}
+            className="p-2 rounded-lg text-text-secondary hover:text-text-primary transition-colors disabled:opacity-30"
+            title="Restart track"
           >
             <SkipBack size={18} />
           </button>
           
           <button
             onClick={togglePlayPause}
-            className="p-2.5 rounded-full bg-gradient-to-r from-accent-purple to-accent-cyan text-bg-primary hover:opacity-90 transition-all shadow-lg shadow-accent-purple/20"
+            disabled={!currentTrack}
+            className={`p-2 rounded-lg transition-colors disabled:opacity-30 group ${
+              isPlaying 
+                ? 'text-text-primary hover:text-accent-red' 
+                : 'text-accent-red hover:text-text-primary'
+            }`}
             title={isPlaying ? 'Pause' : 'Play'}
           >
-            {isPlaying ? <Pause size={20} /> : <Play size={20} className="ml-0.5" />}
+            {isPlaying ? (
+              <>
+                <Play size={20} className="group-hover:hidden" />
+                <Pause size={20} className="hidden group-hover:block" />
+              </>
+            ) : (
+              <>
+                <Pause size={20} className="group-hover:hidden" />
+                <Play size={20} className="hidden group-hover:block" />
+              </>
+            )}
           </button>
           
           <button
             onClick={playNext}
-            className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/5 transition-all"
-            title="Next"
+            disabled={!currentTrack}
+            className="p-2 rounded-lg text-text-secondary hover:text-text-primary transition-colors disabled:opacity-30"
+            title="Skip track"
           >
             <SkipForward size={18} />
           </button>

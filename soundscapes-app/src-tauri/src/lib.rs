@@ -24,6 +24,16 @@ pub struct MusicTrack {
     pub artist: String,
 }
 
+// Current track info for cross-window communication
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CurrentTrackInfo {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub file_path: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MusicAlbum {
     pub name: String,
@@ -146,6 +156,43 @@ pub struct PresetInfo {
     pub sound_count: usize,
 }
 
+// Music Playlist types
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlaylistTrack {
+    pub id: String,
+    pub file: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    #[serde(rename = "albumPath")]
+    pub album_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MusicPlaylist {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "isAuto")]
+    pub is_auto: bool,  // true for "All Music" and "Favorites"
+    pub tracks: Vec<PlaylistTrack>,
+}
+
+// Playlist playback state (shared across windows)
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PlaylistState {
+    #[serde(rename = "currentPlaylistId")]
+    pub current_playlist_id: Option<String>,
+    #[serde(rename = "currentIndex")]
+    pub current_index: i32,
+    #[serde(rename = "isShuffled")]
+    pub is_shuffled: bool,
+    #[serde(rename = "isLooping")]
+    pub is_looping: bool,
+    pub favorites: Vec<String>,  // Track IDs that are favorited
+    #[serde(rename = "interruptedIndex")]
+    pub interrupted_index: Option<i32>,  // For resuming after Play Now
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub music_folder_path: String,
@@ -218,7 +265,7 @@ impl Default for AmbientSettings {
 // Audio Commands sent to the audio thread
 enum AudioCommand {
     // Music commands
-    Play(String),
+    Play { file_path: String, track_info: CurrentTrackInfo },
     Stop,
     Pause,
     Resume,
@@ -226,6 +273,7 @@ enum AudioCommand {
     SetMasterVolume(f32),
     SetMuted(bool),
     SetMasterMuted(bool),
+    SetCrossfadeDuration(f32),
     // Ambient commands
     PlayAmbient {
         id: String,
@@ -761,6 +809,10 @@ struct AudioController {
     sample_buffer: Arc<FftSampleBuffer>,
     ambient_sample_buffer: Arc<AmbientSampleBuffer>,
     active_ambients: Arc<Mutex<HashMap<String, ActiveAmbientInfo>>>,
+    current_track: Arc<Mutex<Option<CurrentTrackInfo>>>,
+    playlist_state: Arc<Mutex<PlaylistState>>,
+    playlists: Arc<Mutex<HashMap<String, MusicPlaylist>>>,
+    all_tracks: Arc<Mutex<Vec<PlaylistTrack>>>,
 }
 
 impl AudioController {
@@ -776,12 +828,17 @@ impl AudioController {
         let sample_buffer = Arc::new(FftSampleBuffer::new());
         let ambient_sample_buffer = Arc::new(AmbientSampleBuffer::new());
         let active_ambients = Arc::new(Mutex::new(HashMap::new()));
+        let current_track = Arc::new(Mutex::new(None::<CurrentTrackInfo>));
+        let playlist_state = Arc::new(Mutex::new(PlaylistState::default()));
+        let playlists = Arc::new(Mutex::new(HashMap::new()));
+        let all_tracks = Arc::new(Mutex::new(Vec::new()));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
         let sample_buffer_clone = sample_buffer.clone();
         let ambient_sample_buffer_clone = ambient_sample_buffer.clone();
         let active_ambients_clone = active_ambients.clone();
+        let current_track_clone = current_track.clone();
         
         // Spawn audio thread
         thread::spawn(move || {
@@ -794,12 +851,15 @@ impl AudioController {
             };
             
             let mut current_sink: Option<Sink> = None;
+            let mut fading_sink: Option<Sink> = None;  // Sink being faded out during crossfade
             let mut music_volume: f32 = 1.0;
             let mut master_volume: f32 = 1.0;
             let mut is_muted = false;
             let mut is_master_muted = false;
             let mut track_start: Option<Instant> = None;
             let mut track_duration: f64 = 0.0;
+            let mut crossfade_duration: f32 = 3.0;  // Default 3 seconds
+            let mut crossfade_progress: Option<(Instant, f32)> = None;  // (start_time, duration)
             
             // FFT setup
             let mut fft_planner = FftPlanner::<f32>::new();
@@ -850,6 +910,40 @@ impl AudioController {
             }
             
             loop {
+                // Handle crossfade volume updates
+                if let Some((fade_start, fade_duration)) = crossfade_progress {
+                    let elapsed = fade_start.elapsed().as_secs_f32();
+                    let progress = (elapsed / fade_duration).clamp(0.0, 1.0);
+                    
+                    let target_vol = if is_muted || is_master_muted {
+                        0.0
+                    } else {
+                        music_volume * master_volume
+                    };
+                    
+                    // Fade in new track
+                    if let Some(ref sink) = current_sink {
+                        sink.set_volume(target_vol * progress);
+                    }
+                    
+                    // Fade out old track
+                    if let Some(ref sink) = fading_sink {
+                        sink.set_volume(target_vol * (1.0 - progress));
+                    }
+                    
+                    // Crossfade complete
+                    if progress >= 1.0 {
+                        if let Some(old_sink) = fading_sink.take() {
+                            old_sink.stop();
+                        }
+                        crossfade_progress = None;
+                        // Set final volume
+                        if let Some(ref sink) = current_sink {
+                            sink.set_volume(target_vol);
+                        }
+                    }
+                }
+                
                 // Update progress
                 if let Some(ref sink) = current_sink {
                     let is_empty = sink.empty();
@@ -955,17 +1049,29 @@ impl AudioController {
                 // Check for commands (non-blocking with timeout)
                 match command_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(cmd) => match cmd {
-                        AudioCommand::Play(path) => {
-                            // Stop current playback
-                            if let Some(sink) = current_sink.take() {
-                                sink.stop();
+                        AudioCommand::Play { file_path, track_info } => {
+                            // Move current sink to fading_sink for crossfade (if crossfade enabled)
+                            if let Some(old_sink) = current_sink.take() {
+                                if crossfade_duration > 0.0 {
+                                    // Stop any existing fading sink
+                                    if let Some(old_fading) = fading_sink.take() {
+                                        old_fading.stop();
+                                    }
+                                    fading_sink = Some(old_sink);
+                                    crossfade_progress = Some((Instant::now(), crossfade_duration));
+                                } else {
+                                    old_sink.stop();
+                                }
                             }
                             
                             // Clear sample buffer for new track
                             sample_buffer_clone.clear();
                             
+                            // Store current track info
+                            *current_track_clone.lock() = Some(track_info);
+                            
                             // Load and play new file
-                            match File::open(&path) {
+                            match File::open(&file_path) {
                                 Ok(file) => {
                                     let reader = BufReader::new(file);
                                     match Decoder::new(reader) {
@@ -983,12 +1089,15 @@ impl AudioController {
                                             
                                             match Sink::try_new(&stream_handle) {
                                                 Ok(sink) => {
-                                                    let effective_vol = if is_muted || is_master_muted {
+                                                    // Start at 0 volume if crossfading, fade in
+                                                    let start_vol = if crossfade_progress.is_some() {
+                                                        0.0
+                                                    } else if is_muted || is_master_muted {
                                                         0.0
                                                     } else {
                                                         music_volume * master_volume
                                                     };
-                                                    sink.set_volume(effective_vol);
+                                                    sink.set_volume(start_vol);
                                                     sink.append(analyzing_source);
                                                     
                                                     track_start = Some(Instant::now());
@@ -1007,7 +1116,7 @@ impl AudioController {
                                         Err(e) => eprintln!("Failed to decode audio: {}", e),
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to open file {}: {}", path, e),
+                                Err(e) => eprintln!("Failed to open file {}: {}", file_path, e),
                             }
                         }
                         AudioCommand::Stop => {
@@ -1015,6 +1124,7 @@ impl AudioController {
                                 sink.stop();
                             }
                             track_start = None;
+                            *current_track_clone.lock() = None;
                             let mut prog = progress_clone.lock();
                             prog.is_playing = false;
                             prog.is_finished = true;
@@ -1072,6 +1182,9 @@ impl AudioController {
                                 };
                                 sink.set_volume(effective_vol);
                             }
+                        }
+                        AudioCommand::SetCrossfadeDuration(duration) => {
+                            crossfade_duration = duration;
                         }
                         // Ambient sound commands with A/B crossfade
                         AudioCommand::PlayAmbient { id, file_a, file_b, settings } => {
@@ -1431,7 +1544,18 @@ impl AudioController {
             }
         });
         
-        Self { command_tx, progress, playback_state, sample_buffer, ambient_sample_buffer, active_ambients }
+        Self { 
+            command_tx, 
+            progress, 
+            playback_state, 
+            sample_buffer, 
+            ambient_sample_buffer, 
+            active_ambients, 
+            current_track,
+            playlist_state,
+            playlists,
+            all_tracks,
+        }
     }
     
     fn send(&self, cmd: AudioCommand) {
@@ -1444,6 +1568,14 @@ impl AudioController {
     
     fn get_playback_state(&self) -> PlaybackState {
         self.playback_state.lock().clone()
+    }
+    
+    fn get_current_track(&self) -> Option<CurrentTrackInfo> {
+        self.current_track.lock().clone()
+    }
+    
+    fn get_playlist_state(&self) -> PlaylistState {
+        self.playlist_state.lock().clone()
     }
 }
 
@@ -1621,9 +1753,130 @@ fn init_audio(state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn play_music(state: tauri::State<Arc<AudioController>>, file_path: String) -> Result<(), String> {
-    state.send(AudioCommand::Play(file_path));
+fn play_music(
+    state: tauri::State<Arc<AudioController>>,
+    file_path: String,
+    id: String,
+    title: String,
+    artist: String,
+    album: String,
+) -> Result<(), String> {
+    let track_info = CurrentTrackInfo {
+        id,
+        title,
+        artist,
+        album,
+        file_path: file_path.clone(),
+    };
+    state.send(AudioCommand::Play { file_path, track_info });
     Ok(())
+}
+
+#[tauri::command]
+fn get_current_track(state: tauri::State<Arc<AudioController>>) -> Result<Option<CurrentTrackInfo>, String> {
+    Ok(state.get_current_track())
+}
+
+// Playlist management commands
+#[tauri::command]
+fn get_playlist_state(state: tauri::State<Arc<AudioController>>) -> Result<PlaylistState, String> {
+    Ok(state.get_playlist_state())
+}
+
+#[tauri::command]
+fn set_playlist_shuffle(state: tauri::State<Arc<AudioController>>, shuffled: bool) -> Result<(), String> {
+    state.playlist_state.lock().is_shuffled = shuffled;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_playlist_loop(state: tauri::State<Arc<AudioController>>, looping: bool) -> Result<(), String> {
+    state.playlist_state.lock().is_looping = looping;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_current_playlist(state: tauri::State<Arc<AudioController>>, playlist_id: Option<String>) -> Result<(), String> {
+    let mut ps = state.playlist_state.lock();
+    ps.current_playlist_id = playlist_id;
+    ps.current_index = 0;
+    ps.interrupted_index = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_playlist_index(state: tauri::State<Arc<AudioController>>, index: i32) -> Result<(), String> {
+    state.playlist_state.lock().current_index = index;
+    Ok(())
+}
+
+#[tauri::command]
+fn toggle_favorite(state: tauri::State<Arc<AudioController>>, track_id: String) -> Result<bool, String> {
+    let mut ps = state.playlist_state.lock();
+    if let Some(pos) = ps.favorites.iter().position(|id| id == &track_id) {
+        ps.favorites.remove(pos);
+        Ok(false)
+    } else {
+        ps.favorites.push(track_id);
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+fn set_crossfade_duration(state: tauri::State<Arc<AudioController>>, duration: f32) -> Result<(), String> {
+    state.send(AudioCommand::SetCrossfadeDuration(duration));
+    Ok(())
+}
+
+#[tauri::command]
+fn get_playlists(state: tauri::State<Arc<AudioController>>) -> Result<Vec<MusicPlaylist>, String> {
+    let playlists = state.playlists.lock();
+    Ok(playlists.values().cloned().collect())
+}
+
+#[tauri::command]
+fn save_playlist(
+    state: tauri::State<Arc<AudioController>>,
+    id: String,
+    name: String,
+    tracks: Vec<PlaylistTrack>,
+) -> Result<(), String> {
+    // Don't allow overwriting auto playlists
+    if id == "all-music" || id == "favorites" {
+        return Err("Cannot modify auto playlists".to_string());
+    }
+    
+    let playlist = MusicPlaylist {
+        id: id.clone(),
+        name,
+        is_auto: false,
+        tracks,
+    };
+    
+    state.playlists.lock().insert(id, playlist);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_playlist(state: tauri::State<Arc<AudioController>>, id: String) -> Result<(), String> {
+    // Don't allow deleting auto playlists
+    if id == "all-music" || id == "favorites" {
+        return Err("Cannot delete auto playlists".to_string());
+    }
+    
+    state.playlists.lock().remove(&id);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_all_tracks(state: tauri::State<Arc<AudioController>>, tracks: Vec<PlaylistTrack>) -> Result<(), String> {
+    *state.all_tracks.lock() = tracks;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_all_tracks(state: tauri::State<Arc<AudioController>>) -> Result<Vec<PlaylistTrack>, String> {
+    Ok(state.all_tracks.lock().clone())
 }
 
 #[tauri::command]
@@ -2011,6 +2264,19 @@ pub fn run() {
             set_music_muted,
             set_master_muted,
             get_music_progress,
+            get_current_track,
+            set_crossfade_duration,
+            get_playlist_state,
+            set_playlist_shuffle,
+            set_playlist_loop,
+            set_current_playlist,
+            set_playlist_index,
+            toggle_favorite,
+            get_playlists,
+            save_playlist,
+            delete_playlist,
+            set_all_tracks,
+            get_all_tracks,
             get_playback_state,
             get_active_ambients,
             preload_ambient_sounds,
