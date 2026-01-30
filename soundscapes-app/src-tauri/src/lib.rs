@@ -298,6 +298,83 @@ where
     }
 }
 
+// Source wrapper for stereo panning (L/R balance)
+// pan: -1.0 = full left, 0.0 = center, 1.0 = full right
+struct PannedSource<S> {
+    inner: S,
+    pan: f32,
+    channels: u16,
+    current_channel: u16,
+}
+
+impl<S> PannedSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(inner: S, pan: f32) -> Self {
+        let channels = inner.channels();
+        Self {
+            inner,
+            pan: pan.clamp(-1.0, 1.0),
+            channels,
+            current_channel: 0,
+        }
+    }
+}
+
+impl<S> Iterator for PannedSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        
+        // Only apply panning to stereo sources
+        if self.channels == 2 {
+            let channel = self.current_channel;
+            self.current_channel = (self.current_channel + 1) % self.channels;
+            
+            // Calculate gain for this channel
+            // Left channel (0): full at pan=-1, half at pan=1
+            // Right channel (1): half at pan=-1, full at pan=1
+            let gain = if channel == 0 {
+                // Left channel: 1.0 when pan <= 0, decreases to 0 as pan -> 1
+                if self.pan <= 0.0 { 1.0 } else { 1.0 - self.pan }
+            } else {
+                // Right channel: 1.0 when pan >= 0, decreases to 0 as pan -> -1
+                if self.pan >= 0.0 { 1.0 } else { 1.0 + self.pan }
+            };
+            
+            Some(sample * gain)
+        } else {
+            Some(sample)
+        }
+    }
+}
+
+impl<S> Source for PannedSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+}
+
 struct AudioController {
     command_tx: Sender<AudioCommand>,
     progress: Arc<Mutex<AudioProgress>>,
@@ -587,8 +664,9 @@ impl AudioController {
                                     if let Ok(file) = File::open(&file_a) {
                                         let reader = BufReader::new(file);
                                         if let Ok(source) = Decoder::new(reader) {
-                                            // Apply pitch (speed) adjustment
-                                            let source = source.speed(settings.pitch);
+                                            // Apply pitch and pan
+                                            let source = source.speed(settings.pitch).convert_samples::<f32>();
+                                            let source = PannedSource::new(source, settings.pan);
                                             
                                             let effective_vol = calc_ambient_volume(
                                                 &settings, ambient_master_volume, master_volume,
@@ -625,10 +703,11 @@ impl AudioController {
                         AudioCommand::UpdateAmbientSettings { id, settings } => {
                             if let Some(state) = ambient_states.get_mut(&id) {
                                 let pitch_changed = (state.settings.pitch - settings.pitch).abs() > 0.001;
+                                let pan_changed = (state.settings.pan - settings.pan).abs() > 0.001;
                                 state.settings = settings;
                                 
-                                // If pitch changed, restart current file with new pitch
-                                if pitch_changed {
+                                // If pitch or pan changed, restart current file with new settings
+                                if pitch_changed || pan_changed {
                                     state.sink.stop();
                                     // Create new sink
                                     if let Ok(new_sink) = Sink::try_new(&stream_handle) {
@@ -640,7 +719,8 @@ impl AudioController {
                                         if let Ok(file) = File::open(file_path) {
                                             let reader = BufReader::new(file);
                                             if let Ok(source) = Decoder::new(reader) {
-                                                let source = source.speed(state.settings.pitch);
+                                                let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                                let source = PannedSource::new(source, state.settings.pan);
                                                 let effective_vol = calc_ambient_volume(
                                                     &state.settings, ambient_master_volume, master_volume,
                                                     is_ambient_muted, is_master_muted
@@ -702,7 +782,8 @@ impl AudioController {
                                         if let Ok(file) = File::open(&state.file_a) {
                                             let reader = BufReader::new(file);
                                             if let Ok(source) = Decoder::new(reader) {
-                                                let source = source.speed(state.settings.pitch);
+                                                let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                                let source = PannedSource::new(source, state.settings.pan);
                                                 let effective_vol = calc_ambient_volume(
                                                     &state.settings, ambient_master_volume, master_volume,
                                                     is_ambient_muted, is_master_muted
@@ -718,7 +799,8 @@ impl AudioController {
                                     if let Ok(file) = File::open(&state.file_b) {
                                         let reader = BufReader::new(file);
                                         if let Ok(source) = Decoder::new(reader) {
-                                            let source = source.speed(state.settings.pitch);
+                                            let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                            let source = PannedSource::new(source, state.settings.pan);
                                             let effective_vol = calc_ambient_volume(
                                                 &state.settings, ambient_master_volume, master_volume,
                                                 is_ambient_muted, is_master_muted
@@ -749,7 +831,8 @@ impl AudioController {
                                             if let Ok(file) = File::open(&state.file_a) {
                                                 let reader = BufReader::new(file);
                                                 if let Ok(source) = Decoder::new(reader) {
-                                                    let source = source.speed(state.settings.pitch);
+                                                    let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                                    let source = PannedSource::new(source, state.settings.pan);
                                                     let effective_vol = calc_ambient_volume(
                                                         &state.settings, ambient_master_volume, master_volume,
                                                         is_ambient_muted, is_master_muted
@@ -765,7 +848,8 @@ impl AudioController {
                                         if let Ok(file) = File::open(&state.file_a) {
                                             let reader = BufReader::new(file);
                                             if let Ok(source) = Decoder::new(reader) {
-                                                let source = source.speed(state.settings.pitch);
+                                                let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                                let source = PannedSource::new(source, state.settings.pan);
                                                 let effective_vol = calc_ambient_volume(
                                                     &state.settings, ambient_master_volume, master_volume,
                                                     is_ambient_muted, is_master_muted
