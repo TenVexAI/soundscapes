@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import './App.css';
 import { Sidebar } from './components/Sidebar/Sidebar';
 import { MainWindow } from './components/MainWindow/MainWindow';
-import { Orb } from './components/MainWindow/Orb';
+import { Visualizer } from './components/MainWindow/Visualizer';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAudioStore } from './stores/audioStore';
 
@@ -22,7 +22,7 @@ function App() {
     <div className="relative h-screen overflow-hidden">
       {/* Full-window shader background */}
       <div className="absolute inset-0 z-0">
-        <Orb />
+        <Visualizer />
       </div>
       
       {/* UI layer on top */}

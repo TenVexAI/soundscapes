@@ -154,6 +154,12 @@ pub struct AppSettings {
     pub presets_folder_path: String,
     pub music_crossfade_duration: f32,
     pub soundboard_duck_amount: f32,
+    #[serde(default = "default_visualization")]
+    pub visualization_type: String,
+}
+
+fn default_visualization() -> String {
+    "orb".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,6 +272,8 @@ struct PlaybackState {
     is_muted: bool,
     // FFT frequency data (0.0-1.0 for each bin)
     frequencies: Vec<f32>,
+    // Ambient amplitude data (0.0-1.0 for each bin) - derived from RMS tracking
+    ambient_frequencies: Vec<f32>,
 }
 
 impl Default for PlaybackState {
@@ -278,6 +286,7 @@ impl Default for PlaybackState {
             master_volume: 1.0,
             is_muted: false,
             frequencies: vec![0.0; FFT_SIZE],
+            ambient_frequencies: vec![0.0; FFT_SIZE],
         }
     }
 }
@@ -319,6 +328,85 @@ impl FftSampleBuffer {
         for atom in &self.buffer {
             atom.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+// Lock-free buffer for ambient audio samples (for amplitude tracking)
+const AMBIENT_BUFFER_SIZE: usize = 2048;
+
+struct AmbientSampleBuffer {
+    buffer: [std::sync::atomic::AtomicU32; AMBIENT_BUFFER_SIZE],
+    write_pos: std::sync::atomic::AtomicUsize,
+}
+
+impl AmbientSampleBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            write_pos: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    
+    fn push(&self, sample: f32) {
+        let pos = self.write_pos.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % AMBIENT_BUFFER_SIZE;
+        self.buffer[pos].store(sample.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    fn get_latest(&self, count: usize) -> Vec<f32> {
+        let write_pos = self.write_pos.load(std::sync::atomic::Ordering::Relaxed);
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let pos = (write_pos + AMBIENT_BUFFER_SIZE - count + i) % AMBIENT_BUFFER_SIZE;
+            let bits = self.buffer[pos].load(std::sync::atomic::Ordering::Relaxed);
+            result.push(f32::from_bits(bits));
+        }
+        result
+    }
+}
+
+// Source wrapper that copies samples for ambient amplitude analysis (lock-free)
+struct AmbientAnalyzingSource<S> {
+    inner: S,
+    sample_buffer: Arc<AmbientSampleBuffer>,
+}
+
+impl<S> AmbientAnalyzingSource<S> {
+    fn new(inner: S, sample_buffer: Arc<AmbientSampleBuffer>) -> Self {
+        Self { inner, sample_buffer }
+    }
+}
+
+impl<S> Iterator for AmbientAnalyzingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.inner.next()?;
+        self.sample_buffer.push(sample);
+        Some(sample)
+    }
+}
+
+impl<S> Source for AmbientAnalyzingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
     }
 }
 
@@ -671,6 +759,7 @@ struct AudioController {
     progress: Arc<Mutex<AudioProgress>>,
     playback_state: Arc<Mutex<PlaybackState>>,
     sample_buffer: Arc<FftSampleBuffer>,
+    ambient_sample_buffer: Arc<AmbientSampleBuffer>,
     active_ambients: Arc<Mutex<HashMap<String, ActiveAmbientInfo>>>,
 }
 
@@ -685,11 +774,13 @@ impl AudioController {
         }));
         let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
         let sample_buffer = Arc::new(FftSampleBuffer::new());
+        let ambient_sample_buffer = Arc::new(AmbientSampleBuffer::new());
         let active_ambients = Arc::new(Mutex::new(HashMap::new()));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
         let sample_buffer_clone = sample_buffer.clone();
+        let ambient_sample_buffer_clone = ambient_sample_buffer.clone();
         let active_ambients_clone = active_ambients.clone();
         
         // Spawn audio thread
@@ -820,6 +911,36 @@ impl AudioController {
                         }
                     }
                     
+                    // Compute ambient frequencies from ambient sample buffer (same FFT approach)
+                    let mut ambient_frequencies = vec![0.0f32; FFT_SIZE];
+                    if active_ambient_count > 0 {
+                        let ambient_samples = ambient_sample_buffer_clone.get_latest(1024);
+                        if ambient_samples.len() >= 1024 {
+                            let mut planner = FftPlanner::new();
+                            let fft = planner.plan_fft_forward(1024);
+                            let mut ambient_fft_buffer: Vec<Complex<f32>> = ambient_samples.iter()
+                                .take(1024)
+                                .map(|&s| Complex::new(s, 0.0))
+                                .collect();
+                            fft.process(&mut ambient_fft_buffer);
+                            
+                            // Convert to frequency bins (same logic as music FFT)
+                            let bins_per_bucket = 512 / FFT_SIZE;
+                            for i in 0..FFT_SIZE {
+                                let mut sum = 0.0f32;
+                                for j in 0..bins_per_bucket {
+                                    let idx = i * bins_per_bucket + j;
+                                    if idx < 512 {
+                                        sum += ambient_fft_buffer[idx].norm();
+                                    }
+                                }
+                                let mag = sum / bins_per_bucket as f32;
+                                let log_mag = (1.0 + mag * 50.0).ln() / 5.0;
+                                ambient_frequencies[i] = log_mag.clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                    
                     let mut state = playback_state_clone.lock();
                     state.music_playing = music_playing;
                     state.music_volume = effective_music_vol;
@@ -828,6 +949,7 @@ impl AudioController {
                     state.master_volume = master_volume;
                     state.is_muted = is_master_muted;
                     state.frequencies = frequencies;
+                    state.ambient_frequencies = ambient_frequencies;
                 }
                 
                 // Check for commands (non-blocking with timeout)
@@ -986,8 +1108,9 @@ impl AudioController {
                                         );
                                         sink.set_volume(effective_vol);
                                         
-                                        // Apply reverb
+                                        // Apply reverb then wrap with amplitude tracking
                                         let source = ReverbSource::new(source, settings.algorithmic_reverb, sample_rate);
+                                        let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                         sink.append(source);
                                         
                                         // Determine initial loop count
@@ -1075,6 +1198,7 @@ impl AudioController {
                                             );
                                             new_sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                             new_sink.append(source);
                                             state.sink = new_sink;
                                         }
@@ -1191,6 +1315,7 @@ impl AudioController {
                                             );
                                             state.sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                             state.sink.append(source);
                                         }
                                         }
@@ -1218,6 +1343,7 @@ impl AudioController {
                                         );
                                         state.sink.set_volume(effective_vol);
                                         let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                        let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                         state.sink.append(source);
                                     }
                                     }
@@ -1260,6 +1386,7 @@ impl AudioController {
                                                 );
                                                 state.sink.set_volume(effective_vol);
                                                 let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                                let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                                 state.sink.append(source);
                                             }
                                             }
@@ -1287,6 +1414,7 @@ impl AudioController {
                                             );
                                             state.sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                             state.sink.append(source);
                                         }
                                         }
@@ -1303,7 +1431,7 @@ impl AudioController {
             }
         });
         
-        Self { command_tx, progress, playback_state, sample_buffer, active_ambients }
+        Self { command_tx, progress, playback_state, sample_buffer, ambient_sample_buffer, active_ambients }
     }
     
     fn send(&self, cmd: AudioCommand) {
@@ -1341,6 +1469,7 @@ fn get_default_settings() -> AppSettings {
         presets_folder_path: base_path.join("Presets").to_string_lossy().to_string(),
         music_crossfade_duration: 3.0,
         soundboard_duck_amount: 0.3,
+        visualization_type: default_visualization(),
     }
 }
 
@@ -1567,6 +1696,7 @@ struct PlaybackStateResponse {
     master_volume: f32,
     is_muted: bool,
     frequencies: Vec<f32>,
+    ambient_frequencies: Vec<f32>,
 }
 
 #[tauri::command]
@@ -1580,6 +1710,7 @@ fn get_playback_state(state: tauri::State<Arc<AudioController>>) -> Result<Playb
         master_volume: ps.master_volume,
         is_muted: ps.is_muted,
         frequencies: ps.frequencies,
+        ambient_frequencies: ps.ambient_frequencies,
     })
 }
 

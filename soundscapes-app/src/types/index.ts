@@ -96,6 +96,7 @@ export interface AppSettings {
   presets_folder_path: string;
   music_crossfade_duration: number;
   soundboard_duck_amount: number;
+  visualization_type: string;
 }
 
 export type ActivePanel = 'music' | 'ambient' | 'soundboard' | 'settings' | null;

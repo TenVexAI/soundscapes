@@ -6,6 +6,7 @@ import { useAmbientStore } from '../../stores/ambientStore';
 import { useSoundboardStore } from '../../stores/soundboardStore';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
+import { getVisualizationList } from '../../visualizations';
 
 interface AudioDevice {
   id: string;
@@ -132,6 +133,29 @@ export const AdvancedSettings: React.FC = () => {
               path={settings.presets_folder_path}
               onChangePath={(path) => updateSetting('presets_folder_path', path)}
             />
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-sm font-medium text-text-primary mb-4">Display</h3>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm text-text-secondary">Visualization</label>
+              <select
+                value={settings.visualization_type || 'orb'}
+                onChange={(e) => updateSetting('visualization_type', e.target.value)}
+                className="w-full px-3 py-2 bg-bg-secondary rounded-lg text-text-primary text-sm border border-border focus:outline-none focus:border-accent-purple"
+              >
+                {getVisualizationList().map((viz) => (
+                  <option key={viz.id} value={viz.id}>
+                    {viz.name}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-text-secondary mt-1">
+                {getVisualizationList().find(v => v.id === (settings.visualization_type || 'orb'))?.description}
+              </p>
+            </div>
           </div>
         </div>
 
