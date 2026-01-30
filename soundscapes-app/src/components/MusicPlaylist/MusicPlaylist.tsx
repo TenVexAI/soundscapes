@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, Star, Play, ListPlus, ListStart, Shuffle, Repeat, Plus, Music, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Star, Play, ListPlus, ListStart, Shuffle, Repeat, Plus, Music, Trash2, Square } from 'lucide-react';
 import { usePlaylistStore } from '../../stores/playlistStore';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -137,6 +137,11 @@ export const MusicPlaylist: React.FC = () => {
   const [newPlaylistName, setNewPlaylistName] = useState('');
   const [selectedTracks, setSelectedTracks] = useState<Set<string>>(new Set());
   const [isSelectMode, setIsSelectMode] = useState(false);
+  
+  // Modal states for save/delete confirmations
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [playlistToDelete, setPlaylistToDelete] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const toggleAlbum = (albumName: string) => {
     const newExpanded = new Set(expandedAlbums);
@@ -146,6 +151,12 @@ export const MusicPlaylist: React.FC = () => {
       newExpanded.add(albumName);
     }
     setExpandedAlbums(newExpanded);
+  };
+
+  // Show toast message temporarily
+  const showToast = (message: string) => {
+    setToastMessage(message);
+    setTimeout(() => setToastMessage(null), 3000);
   };
 
   const handleCreatePlaylist = async () => {
@@ -169,6 +180,7 @@ export const MusicPlaylist: React.FC = () => {
     
     try {
       await createPlaylist(newPlaylistName, selectedTracksList);
+      showToast(`Playlist "${newPlaylistName}" saved!`);
       setNewPlaylistName('');
       setSelectedTracks(new Set());
       setShowCreateDialog(false);
@@ -176,6 +188,25 @@ export const MusicPlaylist: React.FC = () => {
     } catch (error) {
       console.error('Error creating playlist:', error);
     }
+  };
+
+  const handleDeletePlaylist = async () => {
+    if (!playlistToDelete) return;
+    const playlist = playlists.find(p => p.id === playlistToDelete);
+    const playlistName = playlist?.name || 'Playlist';
+    
+    try {
+      await deletePlaylist(playlistToDelete);
+      showToast(`"${playlistName}" deleted`);
+      if (selectedPlaylistId === playlistToDelete) {
+        setSelectedPlaylistId(null);
+      }
+    } catch (error) {
+      console.error('Error deleting playlist:', error);
+    }
+    
+    setShowDeleteConfirm(false);
+    setPlaylistToDelete(null);
   };
 
   const toggleTrackSelection = (trackId: string) => {
@@ -189,7 +220,36 @@ export const MusicPlaylist: React.FC = () => {
   };
 
   const currentPlaylist = playlists.find(p => p.id === currentPlaylistId);
-  const selectedPlaylist = playlists.find(p => p.id === selectedPlaylistId);
+  
+  // Handle both playlists and albums in selection
+  const getSelectedPlaylistOrAlbum = () => {
+    if (!selectedPlaylistId) return null;
+    
+    // Check if it's an album selection
+    if (selectedPlaylistId.startsWith('album-')) {
+      const albumName = selectedPlaylistId.replace('album-', '');
+      const album = albums.find(a => a.name === albumName);
+      if (album) {
+        return {
+          id: selectedPlaylistId,
+          name: album.name,
+          isAuto: true, // Treat as auto so it can't be deleted
+          tracks: album.tracks.map(track => ({
+            id: track.id,
+            file: track.file,
+            title: track.title,
+            artist: track.artist,
+            album: album.name,
+            albumPath: album.path,
+          })),
+        };
+      }
+    }
+    
+    return playlists.find(p => p.id === selectedPlaylistId);
+  };
+  
+  const selectedPlaylist = getSelectedPlaylistOrAlbum();
 
   return (
     <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
@@ -197,6 +257,16 @@ export const MusicPlaylist: React.FC = () => {
       <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
         <h2 className="text-lg font-semibold text-text-primary">Music</h2>
         <div className="flex items-center gap-1">
+          <button
+            onClick={async () => {
+              await invoke('stop_music');
+              setCurrentPlaylist(null);
+            }}
+            className="p-2 rounded-lg transition-colors text-text-secondary hover:text-accent-red hover:bg-bg-secondary"
+            title="Stop playback"
+          >
+            <Square size={18} />
+          </button>
           <button
             onClick={toggleLoop}
             className={`p-2 rounded-lg transition-colors ${
@@ -227,11 +297,20 @@ export const MusicPlaylist: React.FC = () => {
             className="flex-1 bg-bg-secondary text-text-primary text-sm rounded-lg p-2 border border-border"
           >
             <option value="">Library View</option>
-            {playlists.map(p => (
-              <option key={p.id} value={p.id}>
-                {p.name} {p.id === currentPlaylistId ? '▶' : ''} ({p.tracks.length})
-              </option>
-            ))}
+            <optgroup label="Playlists">
+              {playlists.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.name} {p.id === currentPlaylistId ? '▶' : ''} ({p.tracks.length})
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Albums">
+              {albums.map(album => (
+                <option key={`album-${album.name}`} value={`album-${album.name}`}>
+                  {album.name} ({album.tracks.length})
+                </option>
+              ))}
+            </optgroup>
           </select>
           <button
             onClick={() => {
@@ -289,9 +368,17 @@ export const MusicPlaylist: React.FC = () => {
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-medium text-text-primary">{selectedPlaylist.name}</h3>
               <div className="flex items-center gap-1">
-                {currentPlaylistId !== selectedPlaylistId && (
+                {currentPlaylistId !== selectedPlaylistId && selectedPlaylist && selectedPlaylist.tracks.length > 0 && (
                   <button
-                    onClick={() => setCurrentPlaylist(selectedPlaylistId)}
+                    onClick={async () => {
+                      if (selectedPlaylistId.startsWith('album-')) {
+                        // For albums, just play the first track
+                        await playTrack(selectedPlaylist.tracks[0]);
+                      } else {
+                        // For playlists, set the playlist and play from index 0
+                        await playTrackFromPlaylist(selectedPlaylistId, 0);
+                      }
+                    }}
                     className="px-2 py-1 text-xs bg-accent-purple/20 text-accent-purple hover:bg-accent-purple hover:text-white rounded"
                   >
                     Play All
@@ -300,8 +387,8 @@ export const MusicPlaylist: React.FC = () => {
                 {!selectedPlaylist.isAuto && (
                   <button
                     onClick={() => {
-                      deletePlaylist(selectedPlaylistId);
-                      setSelectedPlaylistId(null);
+                      setPlaylistToDelete(selectedPlaylistId);
+                      setShowDeleteConfirm(true);
                     }}
                     className="p-1 text-text-secondary hover:text-accent-red"
                     title="Delete playlist"
@@ -448,6 +535,42 @@ export const MusicPlaylist: React.FC = () => {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      {showDeleteConfirm && playlistToDelete && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-bg-primary rounded-xl border border-border p-4 w-80">
+            <h3 className="text-lg font-semibold text-text-primary mb-2">Delete Playlist?</h3>
+            <p className="text-sm text-text-secondary mb-4">
+              Are you sure you want to delete "{playlists.find(p => p.id === playlistToDelete)?.name}"? This cannot be undone.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  setShowDeleteConfirm(false);
+                  setPlaylistToDelete(null);
+                }}
+                className="flex-1 py-2 text-text-secondary hover:text-text-primary"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeletePlaylist}
+                className="flex-1 py-2 bg-accent-red/20 text-accent-red hover:bg-accent-red hover:text-white rounded-lg"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-bg-secondary border border-border rounded-lg px-4 py-2 shadow-lg z-50">
+          <p className="text-sm text-text-primary">{toastMessage}</p>
         </div>
       )}
     </div>

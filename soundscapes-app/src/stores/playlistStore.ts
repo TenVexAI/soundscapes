@@ -86,6 +86,9 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   loadAlbums: async (folderPath: string) => {
     set({ isLoading: true });
     try {
+      // First load saved playlists and favorites from disk
+      await invoke('load_saved_playlists_and_favorites');
+      
       const albums = await invoke<MusicAlbum[]>('scan_music_folder', { folderPath });
       
       // Build all tracks list
@@ -106,7 +109,7 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
       // Send tracks to backend
       await invoke('set_all_tracks', { tracks: allTracks });
       
-      // Load playlist state from backend
+      // Load playlist state from backend (now includes persisted favorites)
       const backendState = await invoke<BackendPlaylistState>('get_playlist_state');
       const customPlaylists = await invoke<MusicPlaylist[]>('get_playlists');
       

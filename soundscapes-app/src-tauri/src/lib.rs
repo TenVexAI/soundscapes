@@ -851,7 +851,6 @@ impl AudioController {
             };
             
             let mut current_sink: Option<Sink> = None;
-            let mut fading_sink: Option<Sink> = None;  // Sink being faded out during crossfade
             let mut music_volume: f32 = 1.0;
             let mut master_volume: f32 = 1.0;
             let mut is_muted = false;
@@ -859,7 +858,9 @@ impl AudioController {
             let mut track_start: Option<Instant> = None;
             let mut track_duration: f64 = 0.0;
             let mut crossfade_duration: f32 = 3.0;  // Default 3 seconds
-            let mut crossfade_progress: Option<(Instant, f32)> = None;  // (start_time, duration)
+            // Fade states: fade_out for end of current track, fade_in for start of new track
+            let mut fade_out_active: bool = false;  // Currently fading out
+            let mut fade_in_progress: Option<(Instant, f32)> = None;  // (start_time, duration) for fade-in
             
             // FFT setup
             let mut fft_planner = FftPlanner::<f32>::new();
@@ -910,36 +911,55 @@ impl AudioController {
             }
             
             loop {
-                // Handle crossfade volume updates
-                if let Some((fade_start, fade_duration)) = crossfade_progress {
+                let target_vol = if is_muted || is_master_muted {
+                    0.0
+                } else {
+                    music_volume * master_volume
+                };
+                
+                // Handle fade-in for new tracks
+                if let Some((fade_start, fade_duration)) = fade_in_progress {
                     let elapsed = fade_start.elapsed().as_secs_f32();
                     let progress = (elapsed / fade_duration).clamp(0.0, 1.0);
                     
-                    let target_vol = if is_muted || is_master_muted {
-                        0.0
-                    } else {
-                        music_volume * master_volume
-                    };
-                    
-                    // Fade in new track
                     if let Some(ref sink) = current_sink {
                         sink.set_volume(target_vol * progress);
                     }
                     
-                    // Fade out old track
-                    if let Some(ref sink) = fading_sink {
-                        sink.set_volume(target_vol * (1.0 - progress));
-                    }
-                    
-                    // Crossfade complete
+                    // Fade-in complete
                     if progress >= 1.0 {
-                        if let Some(old_sink) = fading_sink.take() {
-                            old_sink.stop();
-                        }
-                        crossfade_progress = None;
-                        // Set final volume
+                        fade_in_progress = None;
                         if let Some(ref sink) = current_sink {
                             sink.set_volume(target_vol);
+                        }
+                    }
+                }
+                
+                // Handle automatic fade-out near end of track
+                if crossfade_duration > 0.0 && !fade_out_active {
+                    if let (Some(start), Some(ref sink)) = (track_start, &current_sink) {
+                        if !sink.is_paused() && !sink.empty() {
+                            let current_time = start.elapsed().as_secs_f64();
+                            let time_remaining = track_duration - current_time;
+                            
+                            // Start fade-out when we're within crossfade_duration of the end
+                            if time_remaining > 0.0 && time_remaining <= crossfade_duration as f64 {
+                                fade_out_active = true;
+                            }
+                        }
+                    }
+                }
+                
+                // Apply fade-out volume
+                if fade_out_active {
+                    if let (Some(start), Some(ref sink)) = (track_start, &current_sink) {
+                        let current_time = start.elapsed().as_secs_f64();
+                        let time_remaining = (track_duration - current_time).max(0.0);
+                        let fade_progress = 1.0 - (time_remaining / crossfade_duration as f64).clamp(0.0, 1.0);
+                        
+                        // Only apply fade-out if we're not also fading in (which takes precedence)
+                        if fade_in_progress.is_none() {
+                            sink.set_volume(target_vol * (1.0 - fade_progress as f32));
                         }
                     }
                 }
@@ -1050,19 +1070,13 @@ impl AudioController {
                 match command_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(cmd) => match cmd {
                         AudioCommand::Play { file_path, track_info } => {
-                            // Move current sink to fading_sink for crossfade (if crossfade enabled)
+                            // Stop current track immediately (fade-out already happened or manual skip)
                             if let Some(old_sink) = current_sink.take() {
-                                if crossfade_duration > 0.0 {
-                                    // Stop any existing fading sink
-                                    if let Some(old_fading) = fading_sink.take() {
-                                        old_fading.stop();
-                                    }
-                                    fading_sink = Some(old_sink);
-                                    crossfade_progress = Some((Instant::now(), crossfade_duration));
-                                } else {
-                                    old_sink.stop();
-                                }
+                                old_sink.stop();
                             }
+                            
+                            // Reset fade states for new track
+                            fade_out_active = false;
                             
                             // Clear sample buffer for new track
                             sample_buffer_clone.clear();
@@ -1089,8 +1103,9 @@ impl AudioController {
                                             
                                             match Sink::try_new(&stream_handle) {
                                                 Ok(sink) => {
-                                                    // Start at 0 volume if crossfading, fade in
-                                                    let start_vol = if crossfade_progress.is_some() {
+                                                    // Start at 0 volume and fade in if crossfade enabled
+                                                    let start_vol = if crossfade_duration > 0.0 {
+                                                        fade_in_progress = Some((Instant::now(), crossfade_duration));
                                                         0.0
                                                     } else if is_muted || is_master_muted {
                                                         0.0
@@ -1784,6 +1799,22 @@ fn get_playlist_state(state: tauri::State<Arc<AudioController>>) -> Result<Playl
 }
 
 #[tauri::command]
+fn load_saved_playlists_and_favorites(app: tauri::AppHandle, state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
+    // Load favorites from disk
+    let favorites = load_favorites_from_disk(&app)?;
+    state.playlist_state.lock().favorites = favorites;
+    
+    // Load playlists from disk
+    let playlists = load_playlists_from_disk(&app)?;
+    let mut playlist_map = state.playlists.lock();
+    for playlist in playlists {
+        playlist_map.insert(playlist.id.clone(), playlist);
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
 fn set_playlist_shuffle(state: tauri::State<Arc<AudioController>>, shuffled: bool) -> Result<(), String> {
     state.playlist_state.lock().is_shuffled = shuffled;
     Ok(())
@@ -1811,15 +1842,20 @@ fn set_playlist_index(state: tauri::State<Arc<AudioController>>, index: i32) -> 
 }
 
 #[tauri::command]
-fn toggle_favorite(state: tauri::State<Arc<AudioController>>, track_id: String) -> Result<bool, String> {
+fn toggle_favorite(app: tauri::AppHandle, state: tauri::State<Arc<AudioController>>, track_id: String) -> Result<bool, String> {
     let mut ps = state.playlist_state.lock();
-    if let Some(pos) = ps.favorites.iter().position(|id| id == &track_id) {
+    let is_favorite = if let Some(pos) = ps.favorites.iter().position(|id| id == &track_id) {
         ps.favorites.remove(pos);
-        Ok(false)
+        false
     } else {
         ps.favorites.push(track_id);
-        Ok(true)
-    }
+        true
+    };
+    
+    // Persist favorites to disk
+    save_favorites_to_disk(&app, &ps.favorites)?;
+    
+    Ok(is_favorite)
 }
 
 #[tauri::command]
@@ -1836,6 +1872,7 @@ fn get_playlists(state: tauri::State<Arc<AudioController>>) -> Result<Vec<MusicP
 
 #[tauri::command]
 fn save_playlist(
+    app: tauri::AppHandle,
     state: tauri::State<Arc<AudioController>>,
     id: String,
     name: String,
@@ -1853,16 +1890,22 @@ fn save_playlist(
         tracks,
     };
     
+    // Persist to disk
+    save_playlist_to_disk(&app, &playlist)?;
+    
     state.playlists.lock().insert(id, playlist);
     Ok(())
 }
 
 #[tauri::command]
-fn delete_playlist(state: tauri::State<Arc<AudioController>>, id: String) -> Result<(), String> {
+fn delete_playlist(app: tauri::AppHandle, state: tauri::State<Arc<AudioController>>, id: String) -> Result<(), String> {
     // Don't allow deleting auto playlists
     if id == "all-music" || id == "favorites" {
         return Err("Cannot delete auto playlists".to_string());
     }
+    
+    // Delete from disk
+    delete_playlist_from_disk(&app, &id)?;
     
     state.playlists.lock().remove(&id);
     Ok(())
@@ -2071,6 +2114,94 @@ fn set_ambient_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> 
     Ok(())
 }
 
+// === Playlist & Favorites Persistence ===
+
+fn get_playlists_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let playlists_dir = app_data.join("playlists");
+    
+    if !playlists_dir.exists() {
+        fs::create_dir_all(&playlists_dir)
+            .map_err(|e| format!("Failed to create playlists directory: {}", e))?;
+    }
+    
+    Ok(playlists_dir)
+}
+
+fn get_favorites_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    
+    if !app_data.exists() {
+        fs::create_dir_all(&app_data)
+            .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+    }
+    
+    Ok(app_data.join("favorites.json"))
+}
+
+fn save_favorites_to_disk(app: &tauri::AppHandle, favorites: &[String]) -> Result<(), String> {
+    let path = get_favorites_path(app)?;
+    let content = serde_json::to_string_pretty(favorites)
+        .map_err(|e| format!("Failed to serialize favorites: {}", e))?;
+    fs::write(&path, content)
+        .map_err(|e| format!("Failed to write favorites file: {}", e))?;
+    Ok(())
+}
+
+fn load_favorites_from_disk(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
+    let path = get_favorites_path(app)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read favorites file: {}", e))?;
+    let favorites: Vec<String> = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse favorites: {}", e))?;
+    Ok(favorites)
+}
+
+fn save_playlist_to_disk(app: &tauri::AppHandle, playlist: &MusicPlaylist) -> Result<(), String> {
+    let playlists_dir = get_playlists_dir(app)?;
+    let playlist_path = playlists_dir.join(format!("{}.playlist", &playlist.id));
+    let content = serde_json::to_string_pretty(playlist)
+        .map_err(|e| format!("Failed to serialize playlist: {}", e))?;
+    fs::write(&playlist_path, content)
+        .map_err(|e| format!("Failed to write playlist file: {}", e))?;
+    Ok(())
+}
+
+fn delete_playlist_from_disk(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let playlists_dir = get_playlists_dir(app)?;
+    let playlist_path = playlists_dir.join(format!("{}.playlist", id));
+    if playlist_path.exists() {
+        fs::remove_file(&playlist_path)
+            .map_err(|e| format!("Failed to delete playlist file: {}", e))?;
+    }
+    Ok(())
+}
+
+fn load_playlists_from_disk(app: &tauri::AppHandle) -> Result<Vec<MusicPlaylist>, String> {
+    let playlists_dir = get_playlists_dir(app)?;
+    let mut playlists = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(&playlists_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("playlist") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(playlist) = serde_json::from_str::<MusicPlaylist>(&content) {
+                        playlists.push(playlist);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(playlists)
+}
+
 // === Preset Management Commands ===
 
 fn get_presets_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -2267,6 +2398,7 @@ pub fn run() {
             get_current_track,
             set_crossfade_duration,
             get_playlist_state,
+            load_saved_playlists_and_favorites,
             set_playlist_shuffle,
             set_playlist_loop,
             set_current_playlist,
