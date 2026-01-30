@@ -1181,6 +1181,14 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // If main window is closed, exit the entire app
+                if window.label() == "main" {
+                    std::process::exit(0);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
