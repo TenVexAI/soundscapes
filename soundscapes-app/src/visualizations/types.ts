@@ -11,9 +11,20 @@ export interface VisualizationShaders {
   fragment: string;
 }
 
+// Buffer pass definition for multi-pass shaders
+export interface BufferPass {
+  fragment: string;
+  // Scale factor for buffer size (1.0 = full resolution, 0.25 = quarter, etc.)
+  scale?: number;
+  // Which previous buffers this pass reads from (by index)
+  inputs?: number[];
+}
+
 export interface Visualization {
   meta: VisualizationMeta;
   shaders: VisualizationShaders;
+  // Optional multi-pass buffers (rendered before main shader)
+  buffers?: BufferPass[];
 }
 
 // Uniforms that all visualizations receive

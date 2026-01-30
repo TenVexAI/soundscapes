@@ -19,7 +19,7 @@ function App() {
   }, []);
 
   return (
-    <div className="relative h-screen overflow-hidden">
+    <div className="relative h-screen overflow-hidden bg-black">
       {/* Full-window shader background */}
       <div className="absolute inset-0 z-0">
         <Visualizer />
