@@ -25,6 +25,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     try {
       const settings = await invoke<AppSettings>('get_settings');
       set({ settings, isLoading: false });
+      
+      // Sync duck amount to backend audio engine on load
+      if (settings.soundboard_duck_amount !== undefined) {
+        await invoke('set_duck_amount', { amount: settings.soundboard_duck_amount });
+      }
     } catch (error) {
       set({ error: String(error), isLoading: false });
     }
@@ -43,11 +48,20 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ activePanel: panel });
   },
   
-  updateSetting: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
+  updateSetting: async <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     const { settings, saveSettings } = get();
     if (settings) {
       const newSettings = { ...settings, [key]: value };
       saveSettings(newSettings);
+      
+      // Sync specific settings to backend audio engine
+      if (key === 'soundboard_duck_amount') {
+        try {
+          await invoke('set_duck_amount', { amount: value as number });
+        } catch (error) {
+          console.error('Failed to set duck amount:', error);
+        }
+      }
     }
   },
 }));

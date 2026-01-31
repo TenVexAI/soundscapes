@@ -275,6 +275,10 @@ enum AudioCommand {
     SetMuted(bool),
     SetMasterMuted(bool),
     SetCrossfadeDuration(f32),
+    // Soundboard commands
+    PlaySoundboard { file_path: String, volume: f32 },
+    StopSoundboard,
+    SetDuckAmount(f32),
     // Ambient commands
     PlayAmbient {
         id: String,
@@ -814,6 +818,7 @@ struct AudioController {
     playlist_state: Arc<Mutex<PlaylistState>>,
     playlists: Arc<Mutex<HashMap<String, MusicPlaylist>>>,
     all_tracks: Arc<Mutex<Vec<PlaylistTrack>>>,
+    soundboard_playing: Arc<Mutex<bool>>,
 }
 
 impl AudioController {
@@ -833,6 +838,7 @@ impl AudioController {
         let playlist_state = Arc::new(Mutex::new(PlaylistState::default()));
         let playlists = Arc::new(Mutex::new(HashMap::new()));
         let all_tracks = Arc::new(Mutex::new(Vec::new()));
+        let soundboard_playing = Arc::new(Mutex::new(false));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
@@ -840,6 +846,7 @@ impl AudioController {
         let ambient_sample_buffer_clone = ambient_sample_buffer.clone();
         let active_ambients_clone = active_ambients.clone();
         let current_track_clone = current_track.clone();
+        let soundboard_playing_clone = soundboard_playing.clone();
         
         // Spawn audio thread
         thread::spawn(move || {
@@ -890,13 +897,22 @@ impl AudioController {
             let mut fading_out: HashMap<String, f32> = HashMap::new();
             const FADE_STEPS: f32 = 4.0; // ~200ms fade (4 steps × 50ms loop)
             
-            // Helper to calculate effective volume with variation
+            // Soundboard state
+            let mut soundboard_sink: Option<Sink> = None;
+            let mut duck_amount: f32 = 0.5; // Default 50% ducking
+            let mut duck_progress: f32 = 0.0; // 0.0 = no ducking, 1.0 = fully ducked
+            let mut duck_target: f32 = 0.0; // Target duck level (0.0 or 1.0)
+            const DUCK_FADE_SPEED: f32 = 0.15; // How fast to fade ducking per loop iteration (~300ms full fade)
+            
+            // Helper to calculate effective volume with variation and ducking
             fn calc_ambient_volume(
                 settings: &AmbientSettings,
                 ambient_master: f32,
                 master: f32,
                 is_ambient_muted: bool,
                 is_master_muted: bool,
+                duck_progress: f32,
+                duck_amount: f32,
             ) -> f32 {
                 if is_ambient_muted || is_master_muted {
                     0.0
@@ -907,16 +923,54 @@ impl AudioController {
                     } else {
                         1.0
                     };
-                    settings.volume * ambient_master * master * variation
+                    let base_vol = settings.volume * ambient_master * master * variation;
+                    // Apply gradual ducking based on duck_progress (0.0 = none, 1.0 = full)
+                    base_vol * (1.0 - duck_progress * duck_amount)
                 }
             }
             
             loop {
+                // Check if soundboard finished playing
+                if let Some(ref sink) = soundboard_sink {
+                    if sink.empty() {
+                        duck_target = 0.0; // Start fading out ducking
+                        soundboard_sink = None;
+                        *soundboard_playing_clone.lock() = false;
+                    }
+                }
+                
+                // Smoothly fade duck_progress toward duck_target
+                if duck_progress < duck_target {
+                    duck_progress = (duck_progress + DUCK_FADE_SPEED).min(duck_target);
+                } else if duck_progress > duck_target {
+                    duck_progress = (duck_progress - DUCK_FADE_SPEED).max(duck_target);
+                }
+                
+                // Apply ducking to music volume (gradual)
                 let target_vol = if is_muted || is_master_muted {
                     0.0
                 } else {
-                    music_volume * master_volume
+                    let base_vol = music_volume * master_volume;
+                    // Apply gradual ducking based on duck_progress
+                    base_vol * (1.0 - duck_progress * duck_amount)
                 };
+                
+                // Update music sink volume during ducking transitions
+                if duck_progress > 0.0 || duck_target != duck_progress {
+                    if let Some(ref sink) = current_sink {
+                        if fade_in_progress.is_none() {
+                            sink.set_volume(target_vol);
+                        }
+                    }
+                    // Update ambient volumes during ducking transitions
+                    for state in ambient_states.values() {
+                        let vol = calc_ambient_volume(
+                            &state.settings, ambient_master_volume, master_volume,
+                            is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                        );
+                        state.sink.set_volume(vol);
+                    }
+                }
                 
                 // Handle fade-in for new tracks
                 if let Some((fade_start, fade_duration)) = fade_in_progress {
@@ -1249,6 +1303,53 @@ impl AudioController {
                         AudioCommand::SetCrossfadeDuration(duration) => {
                             crossfade_duration = duration;
                         }
+                        // Soundboard commands
+                        AudioCommand::PlaySoundboard { file_path, volume } => {
+                            // Stop any current soundboard sound
+                            if let Some(old_sink) = soundboard_sink.take() {
+                                old_sink.stop();
+                            }
+                            
+                            // Start ducking (gradual fade handled by main loop)
+                            duck_target = 1.0;
+                            
+                            // Load and play soundboard sound
+                            match File::open(&file_path) {
+                                Ok(file) => {
+                                    let reader = BufReader::new(file);
+                                    match Decoder::new(reader) {
+                                        Ok(source) => {
+                                            match Sink::try_new(&stream_handle) {
+                                                Ok(sink) => {
+                                                    let effective_vol = if is_master_muted {
+                                                        0.0
+                                                    } else {
+                                                        volume * master_volume
+                                                    };
+                                                    sink.set_volume(effective_vol);
+                                                    sink.append(source.convert_samples::<f32>());
+                                                    soundboard_sink = Some(sink);
+                                                    *soundboard_playing_clone.lock() = true;
+                                                }
+                                                Err(e) => eprintln!("Failed to create soundboard sink: {}", e),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Failed to decode soundboard file: {}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to open soundboard file {}: {}", file_path, e),
+                            }
+                        }
+                        AudioCommand::StopSoundboard => {
+                            if let Some(sink) = soundboard_sink.take() {
+                                sink.stop();
+                            }
+                            duck_target = 0.0; // Start fading out ducking (gradual restore handled by main loop)
+                            *soundboard_playing_clone.lock() = false;
+                        }
+                        AudioCommand::SetDuckAmount(amount) => {
+                            duck_amount = amount;
+                        }
                         // Ambient sound commands with A/B crossfade
                         AudioCommand::PlayAmbient { id, file_a, file_b, settings } => {
                             // Stop existing ambient sound with this ID if any
@@ -1280,7 +1381,7 @@ impl AudioController {
                                         
                                         let effective_vol = calc_ambient_volume(
                                             &settings, ambient_master_volume, master_volume,
-                                            is_ambient_muted, is_master_muted
+                                            is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                         );
                                         sink.set_volume(effective_vol);
                                         
@@ -1370,7 +1471,7 @@ impl AudioController {
                                             let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                             let effective_vol = calc_ambient_volume(
                                                 &state.settings, ambient_master_volume, master_volume,
-                                                is_ambient_muted, is_master_muted
+                                                is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                             );
                                             new_sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
@@ -1384,7 +1485,7 @@ impl AudioController {
                                     // Just update volume
                                     let effective_vol = calc_ambient_volume(
                                         &state.settings, ambient_master_volume, master_volume,
-                                        is_ambient_muted, is_master_muted
+                                        is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                     );
                                     state.sink.set_volume(effective_vol);
                                 }
@@ -1395,7 +1496,7 @@ impl AudioController {
                             for state in ambient_states.values() {
                                 let effective_vol = calc_ambient_volume(
                                     &state.settings, ambient_master_volume, master_volume,
-                                    is_ambient_muted, is_master_muted
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                 );
                                 state.sink.set_volume(effective_vol);
                             }
@@ -1405,7 +1506,7 @@ impl AudioController {
                             for state in ambient_states.values() {
                                 let effective_vol = calc_ambient_volume(
                                     &state.settings, ambient_master_volume, master_volume,
-                                    is_ambient_muted, is_master_muted
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                 );
                                 state.sink.set_volume(effective_vol);
                             }
@@ -1434,7 +1535,7 @@ impl AudioController {
                                 let fade_multiplier = (1.0 - *progress).max(0.0);
                                 let base_vol = calc_ambient_volume(
                                     &state.settings, ambient_master_volume, master_volume,
-                                    is_ambient_muted, is_master_muted
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                 );
                                 state.sink.set_volume(base_vol * fade_multiplier);
                             }
@@ -1487,7 +1588,7 @@ impl AudioController {
                                             let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                             let effective_vol = calc_ambient_volume(
                                                 &state.settings, ambient_master_volume, master_volume,
-                                                is_ambient_muted, is_master_muted
+                                                is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                             );
                                             state.sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
@@ -1515,7 +1616,7 @@ impl AudioController {
                                         let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                         let effective_vol = calc_ambient_volume(
                                             &state.settings, ambient_master_volume, master_volume,
-                                            is_ambient_muted, is_master_muted
+                                            is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                         );
                                         state.sink.set_volume(effective_vol);
                                         let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
@@ -1558,7 +1659,7 @@ impl AudioController {
                                                 let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                                 let effective_vol = calc_ambient_volume(
                                                     &state.settings, ambient_master_volume, master_volume,
-                                                    is_ambient_muted, is_master_muted
+                                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                                 );
                                                 state.sink.set_volume(effective_vol);
                                                 let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
@@ -1586,7 +1687,7 @@ impl AudioController {
                                             let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
                                             let effective_vol = calc_ambient_volume(
                                                 &state.settings, ambient_master_volume, master_volume,
-                                                is_ambient_muted, is_master_muted
+                                                is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                             );
                                             state.sink.set_volume(effective_vol);
                                             let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
@@ -1618,6 +1719,7 @@ impl AudioController {
             playlist_state,
             playlists,
             all_tracks,
+            soundboard_playing,
         }
     }
     
@@ -1992,6 +2094,29 @@ fn resume_music(state: tauri::State<Arc<AudioController>>) -> Result<(), String>
 fn seek_music(state: tauri::State<Arc<AudioController>>, position: f64) -> Result<(), String> {
     state.send(AudioCommand::Seek(position));
     Ok(())
+}
+
+#[tauri::command]
+fn play_soundboard(state: tauri::State<Arc<AudioController>>, file_path: String, volume: f32) -> Result<(), String> {
+    state.send(AudioCommand::PlaySoundboard { file_path, volume });
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_soundboard(state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
+    state.send(AudioCommand::StopSoundboard);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_duck_amount(state: tauri::State<Arc<AudioController>>, amount: f32) -> Result<(), String> {
+    state.send(AudioCommand::SetDuckAmount(amount));
+    Ok(())
+}
+
+#[tauri::command]
+fn is_soundboard_playing(state: tauri::State<Arc<AudioController>>) -> bool {
+    *state.soundboard_playing.lock()
 }
 
 #[tauri::command]
@@ -2445,6 +2570,10 @@ pub fn run() {
             pause_music,
             resume_music,
             seek_music,
+            play_soundboard,
+            stop_soundboard,
+            set_duck_amount,
+            is_soundboard_playing,
             set_music_volume,
             set_master_volume,
             set_music_muted,

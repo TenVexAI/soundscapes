@@ -41,18 +41,48 @@ export const useSoundboardStore = create<SoundboardState>((set, get) => ({
     }
   },
   
-  playSound: (soundId: string) => {
-    const { sounds } = get();
+  playSound: async (soundId: string) => {
+    const { sounds, currentlyPlaying } = get();
     const sound = sounds.find(s => s.id === soundId);
     
     if (sound) {
-      // TODO: Implement soundboard playback in Rust backend
-      console.log('Playing soundboard sound:', sound.name);
-      set({ currentlyPlaying: soundId });
+      // If clicking the same sound that's playing, stop it
+      if (currentlyPlaying === soundId) {
+        try {
+          await invoke('stop_soundboard');
+          set({ currentlyPlaying: null });
+        } catch (error) {
+          console.error('Error stopping soundboard:', error);
+        }
+        return;
+      }
       
-      setTimeout(() => {
-        set({ currentlyPlaying: null });
-      }, 2000);
+      try {
+        // Play the soundboard sound (volume is 0-100, convert to 0-1)
+        await invoke('play_soundboard', { 
+          filePath: sound.filePath, 
+          volume: sound.volume / 100 
+        });
+        set({ currentlyPlaying: soundId });
+        
+        // Start polling to detect when sound finishes
+        const pollInterval = setInterval(async () => {
+          try {
+            const isPlaying = await invoke<boolean>('is_soundboard_playing');
+            if (!isPlaying) {
+              clearInterval(pollInterval);
+              // Only clear if this sound is still marked as playing
+              if (get().currentlyPlaying === soundId) {
+                set({ currentlyPlaying: null });
+              }
+            }
+          } catch {
+            clearInterval(pollInterval);
+          }
+        }, 100); // Poll every 100ms
+      } catch (error) {
+        console.error('Error playing soundboard sound:', error);
+      }
     }
   },
   
