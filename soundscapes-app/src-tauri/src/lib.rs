@@ -269,6 +269,7 @@ enum AudioCommand {
     Stop,
     Pause,
     Resume,
+    Seek(f64), // Seek to position in seconds
     SetVolume(f32),
     SetMasterVolume(f32),
     SetMuted(bool),
@@ -1154,6 +1155,53 @@ impl AudioController {
                                 sink.play();
                             }
                         }
+                        AudioCommand::Seek(position) => {
+                            // Seeking requires reloading the file and skipping to position
+                            if let Some(track_info) = current_track_clone.lock().clone() {
+                                if let Some(old_sink) = current_sink.take() {
+                                    old_sink.stop();
+                                }
+                                sample_buffer_clone.clear();
+                                
+                                if let Ok(file) = File::open(&track_info.file_path) {
+                                    let reader = BufReader::new(file);
+                                    if let Ok(source) = Decoder::new(reader) {
+                                        let duration = source.total_duration()
+                                            .map(|d| d.as_secs_f64())
+                                            .unwrap_or(0.0);
+                                        
+                                        // Skip to the desired position
+                                        let skip_duration = std::time::Duration::from_secs_f64(position.min(duration).max(0.0));
+                                        let source_f32 = source.convert_samples::<f32>();
+                                        let skipped_source = source_f32.skip_duration(skip_duration);
+                                        let analyzing_source = AnalyzingSource::new(
+                                            skipped_source,
+                                            sample_buffer_clone.clone()
+                                        );
+                                        
+                                        if let Ok(sink) = Sink::try_new(&stream_handle) {
+                                            let effective_vol = if is_muted || is_master_muted {
+                                                0.0
+                                            } else {
+                                                music_volume * master_volume
+                                            };
+                                            sink.set_volume(effective_vol);
+                                            sink.append(analyzing_source);
+                                            
+                                            track_start = Some(Instant::now() - skip_duration);
+                                            track_duration = duration;
+                                            current_sink = Some(sink);
+                                            
+                                            let mut prog = progress_clone.lock();
+                                            prog.current_time = position;
+                                            prog.duration = duration;
+                                            prog.is_playing = true;
+                                            prog.is_finished = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         AudioCommand::SetVolume(vol) => {
                             music_volume = vol;
                             if let Some(ref sink) = current_sink {
@@ -1941,6 +1989,12 @@ fn resume_music(state: tauri::State<Arc<AudioController>>) -> Result<(), String>
 }
 
 #[tauri::command]
+fn seek_music(state: tauri::State<Arc<AudioController>>, position: f64) -> Result<(), String> {
+    state.send(AudioCommand::Seek(position));
+    Ok(())
+}
+
+#[tauri::command]
 fn set_music_volume(state: tauri::State<Arc<AudioController>>, volume: f32) -> Result<(), String> {
     state.send(AudioCommand::SetVolume(volume));
     Ok(())
@@ -2390,6 +2444,7 @@ pub fn run() {
             stop_music,
             pause_music,
             resume_music,
+            seek_music,
             set_music_volume,
             set_master_volume,
             set_music_muted,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Play, Pause, SkipBack, SkipForward } from 'lucide-react';
 import { useAudioStore } from '../../stores/audioStore';
 import { invoke } from '@tauri-apps/api/core';
@@ -23,6 +23,9 @@ export const NowPlaying: React.FC = () => {
   const [currentTrack, setCurrentTrack] = useState<CurrentTrackInfo | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState({ currentTime: 0, duration: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragPosition, setDragPosition] = useState(0);
+  const progressBarRef = useRef<HTMLDivElement>(null);
 
   // Poll for current track and progress from backend
   useEffect(() => {
@@ -95,6 +98,59 @@ export const NowPlaying: React.FC = () => {
   const progressPercent = progress.duration > 0 
     ? (progress.currentTime / progress.duration) * 100 
     : 0;
+
+  const displayPercent = isDragging ? (dragPosition / progress.duration) * 100 : progressPercent;
+
+  const handleSeek = async (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!progressBarRef.current || progress.duration === 0) return;
+    
+    const rect = progressBarRef.current.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const percent = Math.max(0, Math.min(1, clickX / rect.width));
+    const seekPosition = percent * progress.duration;
+    
+    try {
+      await invoke('seek_music', { position: seekPosition });
+    } catch (err) {
+      console.error('Error seeking:', err);
+    }
+  };
+
+  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!progressBarRef.current || progress.duration === 0) return;
+    
+    setIsDragging(true);
+    const rect = progressBarRef.current.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const percent = Math.max(0, Math.min(1, clickX / rect.width));
+    setDragPosition(percent * progress.duration);
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const moveX = moveEvent.clientX - rect.left;
+      const movePercent = Math.max(0, Math.min(1, moveX / rect.width));
+      setDragPosition(movePercent * progress.duration);
+    };
+
+    const handleMouseUp = async (upEvent: MouseEvent) => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      
+      const upX = upEvent.clientX - rect.left;
+      const upPercent = Math.max(0, Math.min(1, upX / rect.width));
+      const seekPosition = upPercent * progress.duration;
+      
+      setIsDragging(false);
+      
+      try {
+        await invoke('seek_music', { position: seekPosition });
+      } catch (err) {
+        console.error('Error seeking:', err);
+      }
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
 
   return (
     <div className={`relative overflow-hidden rounded-xl bg-bg-primary/70 border border-border/50 backdrop-blur-md ${isMusicMuted ? 'opacity-50' : ''}`}>
@@ -170,12 +226,17 @@ export const NowPlaying: React.FC = () => {
         </div>
       </div>
       
-      {/* Progress bar at bottom */}
+      {/* Progress bar at bottom - clickable and draggable */}
       {currentTrack && (
-        <div className="h-1 bg-bg-primary/50">
+        <div 
+          ref={progressBarRef}
+          className="h-2 bg-bg-primary/50 cursor-pointer group"
+          onMouseDown={handleMouseDown}
+          onClick={handleSeek}
+        >
           <div 
-            className="h-full bg-gradient-to-r from-accent-purple to-accent-cyan transition-all duration-100"
-            style={{ width: `${progressPercent}%` }}
+            className="h-full bg-gradient-to-r from-accent-purple to-accent-cyan transition-all duration-100 group-hover:from-accent-purple/80 group-hover:to-accent-cyan/80"
+            style={{ width: `${displayPercent}%` }}
           />
         </div>
       )}
