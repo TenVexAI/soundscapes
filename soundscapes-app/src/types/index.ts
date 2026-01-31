@@ -97,9 +97,39 @@ export interface AppSettings {
   music_crossfade_duration: number;
   soundboard_duck_amount: number;
   visualization_type: string;
+  master_volume: number;
+  music_volume: number;
+  ambient_volume: number;
+  soundboard_volume: number;
 }
 
 export type ActivePanel = 'music' | 'ambient' | 'soundboard' | 'settings' | null;
+
+// Schedule types for the Soundscapes Scheduler
+export interface ScheduledItem {
+  id: string;
+  presetId: string;
+  presetName: string;
+  minMinutes: number;
+  maxMinutes: number;
+  order: number;
+}
+
+export interface SchedulePreset {
+  id: string;
+  name: string;
+  created: string;
+  modified: string;
+  items: ScheduledItem[];
+}
+
+export interface SchedulePresetInfo {
+  id: string;
+  name: string;
+  created: string;
+  modified: string;
+  itemCount: number;
+}
 
 export const DEFAULT_AMBIENT_SETTINGS: AmbientSoundDefaults = {
   volume: 50,

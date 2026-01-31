@@ -40,6 +40,8 @@ interface AmbientState {
   deselectAllInCategory: (categoryName: string) => void;
   setHideUnselected: (hide: boolean) => void;
   clearAll: () => void;
+  transitionToSounds: (newSounds: AmbientSound[]) => Promise<void>;
+  prepareFadeOut: (nextSoundIds: Set<string>) => Promise<void>;
 }
 
 export const useAmbientStore = create<AmbientState>((set, get) => ({
@@ -389,5 +391,108 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
     }
     
     set({ activeSounds: new Map() });
+  },
+  
+  // Smart transition for SCHEDULER: uses 2000ms fades for smooth preset transitions
+  // stop sounds not in new preset, start sounds not already playing, 
+  // update settings for shared sounds, keep common sounds playing continuously
+  transitionToSounds: async (newSounds: AmbientSound[]) => {
+    const { activeSounds } = get();
+    const newSoundsMap = new Map(newSounds.map(s => [s.id, s]));
+    const currentSoundIds = new Set(activeSounds.keys());
+    
+    // Find sounds to stop (in current but not in new)
+    const soundsToStop: string[] = [];
+    for (const id of currentSoundIds) {
+      if (!newSoundsMap.has(id)) {
+        soundsToStop.push(id);
+      }
+    }
+    
+    // Find sounds to start (in new but not in current)
+    const soundsToStart: AmbientSound[] = [];
+    // Find sounds to update settings (in both, keep playing but update settings)
+    const soundsToUpdate: AmbientSound[] = [];
+    
+    for (const sound of newSounds) {
+      if (!currentSoundIds.has(sound.id)) {
+        soundsToStart.push(sound);
+      } else {
+        // Sound exists in both - update its settings
+        soundsToUpdate.push(sound);
+      }
+    }
+    
+    // Sounds to stop were already faded out by prepareFadeOut (called 2s before transition)
+    // Just update the active sounds map - remove stopped sounds
+    const newActiveSounds = new Map(activeSounds);
+    for (const id of soundsToStop) {
+      newActiveSounds.delete(id);
+    }
+    
+    // Update settings for shared sounds (2000ms volume transition)
+    for (const sound of soundsToUpdate) {
+      newActiveSounds.set(sound.id, sound);
+      await invoke('update_ambient_settings_scheduler', {
+        id: sound.id,
+        volume: sound.volume / 100,
+        pitch: sound.pitch,
+        pan: sound.pan / 100,
+        lowPassFreq: sound.lowPassFreq,
+        reverbType: sound.reverbType,
+        algorithmicReverb: sound.algorithmicReverb / 100,
+        repeatMin: sound.repeatRangeMin,
+        repeatMax: sound.repeatRangeMax,
+        pauseMin: sound.pauseRangeMin,
+        pauseMax: sound.pauseRangeMax,
+        volumeVariation: sound.volumeVariation / 100,
+      });
+    }
+    
+    // Start new sounds (2000ms fade in)
+    for (let i = 0; i < soundsToStart.length; i++) {
+      const sound = soundsToStart[i];
+      newActiveSounds.set(sound.id, sound);
+      
+      const fileA = `${sound.categoryPath}/${sound.filesA}`;
+      const fileB = `${sound.categoryPath}/${sound.filesB}`;
+      
+      await invoke('play_ambient_scheduler', {
+        id: sound.id,
+        fileA,
+        fileB,
+        volume: sound.volume / 100,
+        pitch: sound.pitch,
+        pan: sound.pan / 100,
+        lowPassFreq: sound.lowPassFreq,
+        reverbType: sound.reverbType,
+        algorithmicReverb: sound.algorithmicReverb / 100,
+        repeatMin: sound.repeatRangeMin,
+        repeatMax: sound.repeatRangeMax,
+        pauseMin: sound.pauseRangeMin,
+        pauseMax: sound.pauseRangeMax,
+        volumeVariation: sound.volumeVariation / 100,
+      });
+      
+      // Small delay between sounds to prevent audio buffer overload
+      if (i < soundsToStart.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+    }
+    
+    set({ activeSounds: newActiveSounds });
+  },
+  
+  // Called 2 seconds before transition to start fading out sounds that won't continue
+  prepareFadeOut: async (nextSoundIds: Set<string>) => {
+    const { activeSounds } = get();
+    
+    // Find sounds that are playing now but won't be in the next preset
+    for (const [id] of activeSounds) {
+      if (!nextSoundIds.has(id)) {
+        // Start 2000ms fade out for this sound
+        await invoke('stop_ambient_scheduler', { id });
+      }
+    }
   },
 }));

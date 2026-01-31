@@ -8,7 +8,7 @@ interface SettingsState {
   isLoading: boolean;
   error: string | null;
   
-  loadSettings: () => Promise<void>;
+  loadSettings: () => Promise<AppSettings | null>;
   saveSettings: (settings: AppSettings) => Promise<void>;
   setActivePanel: (panel: ActivePanel) => void;
   updateSetting: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void;
@@ -30,8 +30,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       if (settings.soundboard_duck_amount !== undefined) {
         await invoke('set_duck_amount', { amount: settings.soundboard_duck_amount });
       }
+      
+      // Return settings so caller can use them for volume initialization
+      return settings;
     } catch (error) {
       set({ error: String(error), isLoading: false });
+      return null;
     }
   },
   

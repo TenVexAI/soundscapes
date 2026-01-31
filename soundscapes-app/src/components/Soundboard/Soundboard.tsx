@@ -1,13 +1,56 @@
-import React from 'react';
-import { Volume2 } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Volume2, Settings } from 'lucide-react';
 import { useSoundboardStore } from '../../stores/soundboardStore';
+import { SoundEditModal } from './SoundEditModal';
+import { SoundboardSound } from '../../types';
 
 export const Soundboard: React.FC = () => {
-  const { sounds, currentlyPlaying, playSound, updateSoundVolume } = useSoundboardStore();
+  const { sounds, currentlyPlaying, playSound, playSoundByHotkey, updateSoundVolume, updateSound } = useSoundboardStore();
+  const [editingSound, setEditingSound] = useState<SoundboardSound | null>(null);
+
+  // Global hotkey listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't trigger hotkeys when typing in inputs or when modal is open
+      if (editingSound) return;
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
+      // Build hotkey string to match
+      let hotkeyStr = '';
+      if (e.ctrlKey) hotkeyStr += 'Ctrl+';
+      if (e.altKey) hotkeyStr += 'Alt+';
+      if (e.shiftKey) hotkeyStr += 'Shift+';
+      
+      if (e.key === ' ') {
+        hotkeyStr += 'Space';
+      } else if (e.key.length === 1) {
+        hotkeyStr += e.key.toUpperCase();
+      } else {
+        hotkeyStr += e.key;
+      }
+
+      // Check if any sound matches this hotkey
+      const matchingSound = sounds.find(s => s.hotkey?.toLowerCase() === hotkeyStr.toLowerCase());
+      if (matchingSound) {
+        e.preventDefault();
+        playSoundByHotkey(hotkeyStr);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [sounds, playSoundByHotkey, editingSound]);
+
+  const handleEditSave = (updates: { name: string; hotkey: string | null; color: string }) => {
+    if (editingSound) {
+      updateSound(editingSound.id, updates);
+    }
+  };
 
   return (
     <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
-      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
+      <div className="flex items-center justify-between pb-3 border-b border-border" style={{ marginBottom: '16px' }}>
         <h2 className="text-lg font-semibold text-text-primary">Soundboard</h2>
       </div>
 
@@ -21,6 +64,18 @@ export const Soundboard: React.FC = () => {
                   currentlyPlaying === sound.id ? 'ring-2 ring-accent-cyan scale-95' : ''
                 }`}
               >
+                {/* Edit button */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingSound(sound);
+                  }}
+                  className="absolute top-2 left-2 p-1.5 rounded bg-black/30 hover:bg-black/50 transition-colors z-10"
+                  title="Edit sound"
+                >
+                  <Settings size={14} className="text-white/80" />
+                </button>
+
                 <button
                   onClick={() => playSound(sound.id)}
                   className="w-full aspect-square flex flex-col items-center justify-center p-4 transition-all hover:brightness-110"
@@ -61,6 +116,15 @@ export const Soundboard: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Edit Modal */}
+      {editingSound && (
+        <SoundEditModal
+          sound={editingSound}
+          onClose={() => setEditingSound(null)}
+          onSave={handleEditSave}
+        />
+      )}
     </div>
   );
 };

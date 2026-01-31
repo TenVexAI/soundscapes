@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { AppSettings } from '../types';
 
 interface AudioState {
   masterVolume: number;
@@ -15,10 +16,11 @@ interface AudioState {
   isInitialized: boolean;
   
   initAudio: () => Promise<void>;
-  setMasterVolume: (volume: number) => void;
-  setMusicVolume: (volume: number) => void;
-  setAmbientVolume: (volume: number) => void;
-  setSoundboardVolume: (volume: number) => void;
+  loadVolumesFromSettings: (settings: AppSettings) => void;
+  setMasterVolume: (volume: number, save?: boolean) => void;
+  setMusicVolume: (volume: number, save?: boolean) => void;
+  setAmbientVolume: (volume: number, save?: boolean) => void;
+  setSoundboardVolume: (volume: number, save?: boolean) => void;
   toggleMasterMute: () => void;
   toggleMusicMute: () => void;
   toggleAmbientMute: () => void;
@@ -41,33 +43,55 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   initAudio: async () => {
     try {
       await invoke('init_audio');
-      const { masterVolume, musicVolume } = get();
+      const { masterVolume, musicVolume, ambientVolume } = get();
       await invoke('set_master_volume', { volume: masterVolume / 100 });
       await invoke('set_music_volume', { volume: musicVolume / 100 });
+      await invoke('set_ambient_master_volume', { volume: ambientVolume / 100 });
       set({ isInitialized: true });
     } catch (error) {
       console.error('Failed to initialize audio:', error);
     }
   },
   
-  setMasterVolume: (volume: number) => {
+  loadVolumesFromSettings: (settings: AppSettings) => {
+    set({
+      masterVolume: settings.master_volume ?? 50,
+      musicVolume: settings.music_volume ?? 50,
+      ambientVolume: settings.ambient_volume ?? 50,
+      soundboardVolume: settings.soundboard_volume ?? 50,
+    });
+  },
+  
+  setMasterVolume: (volume: number, save = true) => {
     invoke('set_master_volume', { volume: volume / 100 }).catch(console.error);
     set({ masterVolume: volume });
+    if (save) {
+      invoke('save_volume_setting', { key: 'master_volume', value: volume }).catch(console.error);
+    }
   },
   
-  setMusicVolume: (volume: number) => {
+  setMusicVolume: (volume: number, save = true) => {
     invoke('set_music_volume', { volume: volume / 100 }).catch(console.error);
     set({ musicVolume: volume });
+    if (save) {
+      invoke('save_volume_setting', { key: 'music_volume', value: volume }).catch(console.error);
+    }
   },
   
-  setAmbientVolume: (volume: number) => {
+  setAmbientVolume: (volume: number, save = true) => {
     invoke('set_ambient_master_volume', { volume: volume / 100 }).catch(console.error);
     set({ ambientVolume: volume });
+    if (save) {
+      invoke('save_volume_setting', { key: 'ambient_volume', value: volume }).catch(console.error);
+    }
   },
   
-  setSoundboardVolume: (volume: number) => {
+  setSoundboardVolume: (volume: number, save = true) => {
     // TODO: Implement soundboard volume in Rust backend
     set({ soundboardVolume: volume });
+    if (save) {
+      invoke('save_volume_setting', { key: 'soundboard_volume', value: volume }).catch(console.error);
+    }
   },
   
   toggleMasterMute: () => {

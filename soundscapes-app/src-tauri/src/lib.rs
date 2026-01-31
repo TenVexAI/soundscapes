@@ -156,6 +156,40 @@ pub struct PresetInfo {
     pub sound_count: usize,
 }
 
+// Schedule types for the Soundscapes Scheduler
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScheduledItem {
+    pub id: String,
+    #[serde(rename = "presetId")]
+    pub preset_id: String,
+    #[serde(rename = "presetName")]
+    pub preset_name: String,
+    #[serde(rename = "minMinutes")]
+    pub min_minutes: u32,
+    #[serde(rename = "maxMinutes")]
+    pub max_minutes: u32,
+    pub order: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SchedulePreset {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub modified: String,
+    pub items: Vec<ScheduledItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SchedulePresetInfo {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub modified: String,
+    #[serde(rename = "itemCount")]
+    pub item_count: usize,
+}
+
 // Music Playlist types
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlaylistTrack {
@@ -203,6 +237,18 @@ pub struct AppSettings {
     pub soundboard_duck_amount: f32,
     #[serde(default = "default_visualization")]
     pub visualization_type: String,
+    #[serde(default = "default_volume")]
+    pub master_volume: f32,
+    #[serde(default = "default_volume")]
+    pub music_volume: f32,
+    #[serde(default = "default_volume")]
+    pub ambient_volume: f32,
+    #[serde(default = "default_volume")]
+    pub soundboard_volume: f32,
+}
+
+fn default_volume() -> f32 {
+    50.0
 }
 
 fn default_visualization() -> String {
@@ -291,6 +337,15 @@ enum AudioCommand {
     SetAmbientMasterVolume(f32),
     SetAmbientMuted(bool),
     PreloadAmbient(Vec<String>), // Preload audio files into memory cache
+    // Scheduler-specific commands with longer fade times (2000ms)
+    PlayAmbientScheduler {
+        id: String,
+        file_a: String,
+        file_b: String,
+        settings: AmbientSettings,
+    },
+    StopAmbientScheduler(String),
+    UpdateAmbientSettingsScheduler { id: String, settings: AmbientSettings },
 }
 
 // Shared state for tracking active ambient sounds (queryable from outside audio thread)
@@ -895,7 +950,19 @@ impl AudioController {
             
             // Track sounds that are fading out before stop (id -> fade progress 0.0-1.0)
             let mut fading_out: HashMap<String, f32> = HashMap::new();
+            // Track sounds that are fading in after start (id -> fade progress 0.0-1.0)
+            let mut fading_in: HashMap<String, f32> = HashMap::new();
+            // Track volume transitions for smooth settings changes (id -> (current_vol, target_vol))
+            let mut volume_transitions: HashMap<String, (f32, f32)> = HashMap::new();
             const FADE_STEPS: f32 = 4.0; // ~200ms fade (4 steps × 50ms loop)
+            const VOLUME_TRANSITION_SPEED: f32 = 0.08; // Volume change per loop iteration (~400ms full transition)
+            
+            // Scheduler-specific fades with longer duration (2000ms)
+            let mut scheduler_fading_out: HashMap<String, f32> = HashMap::new();
+            let mut scheduler_fading_in: HashMap<String, f32> = HashMap::new();
+            let mut scheduler_volume_transitions: HashMap<String, (f32, f32)> = HashMap::new();
+            const SCHEDULER_FADE_STEPS: f32 = 40.0; // ~2000ms fade (40 steps × 50ms loop)
+            const SCHEDULER_VOLUME_TRANSITION_SPEED: f32 = 0.025; // ~2000ms full transition
             
             // Soundboard state
             let mut soundboard_sink: Option<Sink> = None;
@@ -1379,16 +1446,16 @@ impl AudioController {
                                         let source = PannedSource::new(source, settings.pan);
                                         let source = LowPassSource::new(source, settings.low_pass_freq, sample_rate);
                                         
-                                        let effective_vol = calc_ambient_volume(
-                                            &settings, ambient_master_volume, master_volume,
-                                            is_ambient_muted, is_master_muted, duck_progress, duck_amount
-                                        );
-                                        sink.set_volume(effective_vol);
+                                        // Start at 0 volume for fade-in
+                                        sink.set_volume(0.0);
                                         
                                         // Apply reverb then wrap with amplitude tracking
                                         let source = ReverbSource::new(source, settings.algorithmic_reverb, sample_rate);
                                         let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
                                         sink.append(source);
+                                        
+                                        // Start fade-in
+                                        fading_in.insert(id.clone(), 0.0);
                                         
                                         // Determine initial loop count
                                         let mut rng = rand::thread_rng();
@@ -1482,12 +1549,16 @@ impl AudioController {
                                         }
                                     }
                                 } else {
-                                    // Just update volume
-                                    let effective_vol = calc_ambient_volume(
+                                    // Smooth volume transition - set target and let the loop interpolate
+                                    let target_vol = calc_ambient_volume(
                                         &state.settings, ambient_master_volume, master_volume,
                                         is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                     );
-                                    state.sink.set_volume(effective_vol);
+                                    // Get current volume (or use sink's current if not transitioning)
+                                    let current_vol = volume_transitions.get(&id)
+                                        .map(|(c, _)| *c)
+                                        .unwrap_or_else(|| state.sink.volume());
+                                    volume_transitions.insert(id.clone(), (current_vol, target_vol));
                                 }
                             }
                         }
@@ -1524,6 +1595,142 @@ impl AudioController {
                                 }
                             }
                         }
+                        // Scheduler-specific commands with 2000ms fade times
+                        AudioCommand::PlayAmbientScheduler { id, file_a, file_b, settings } => {
+                            // Stop existing ambient sound with this ID if any (with scheduler fade)
+                            if ambient_states.contains_key(&id) && !scheduler_fading_out.contains_key(&id) {
+                                scheduler_fading_out.insert(id.clone(), 0.0);
+                            }
+                            
+                            // Create sink and start with file A
+                            match Sink::try_new(&stream_handle) {
+                                Ok(sink) => {
+                                    let bytes = if let Some(cached_bytes) = audio_cache.get(&file_a) {
+                                        Some(cached_bytes.clone())
+                                    } else {
+                                        File::open(&file_a).ok().and_then(|mut f| {
+                                            let mut bytes = Vec::new();
+                                            f.read_to_end(&mut bytes).ok().map(|_| bytes)
+                                        })
+                                    };
+                                    
+                                    if let Some(bytes) = bytes {
+                                    if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                        let sample_rate = source.sample_rate();
+                                        let source = source.speed(settings.pitch).convert_samples::<f32>();
+                                        let source = PannedSource::new(source, settings.pan);
+                                        let source = LowPassSource::new(source, settings.low_pass_freq, sample_rate);
+                                        
+                                        // Start at 0 volume for scheduler fade-in (2000ms)
+                                        sink.set_volume(0.0);
+                                        
+                                        let source = ReverbSource::new(source, settings.algorithmic_reverb, sample_rate);
+                                        let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
+                                        sink.append(source);
+                                        
+                                        // Start scheduler fade-in (2000ms)
+                                        scheduler_fading_in.insert(id.clone(), 0.0);
+                                        
+                                        let mut rng = rand::thread_rng();
+                                        let loops = rng.gen_range(settings.repeat_min..=settings.repeat_max);
+                                        
+                                        ambient_states.insert(id.clone(), AmbientState {
+                                            sink,
+                                            file_a: file_a.clone(),
+                                            file_b: file_b.clone(),
+                                            settings: settings.clone(),
+                                            is_playing_a: true,
+                                            loops_remaining: loops,
+                                            pause_remaining: 0.0,
+                                            is_paused: false,
+                                        });
+                                        
+                                        {
+                                            let mut active = active_ambients_clone.lock();
+                                            active.insert(id.clone(), ActiveAmbientInfo {
+                                                id,
+                                                file_a,
+                                                file_b,
+                                                settings,
+                                            });
+                                        }
+                                    }
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to create ambient sink: {}", e),
+                            }
+                        }
+                        AudioCommand::StopAmbientScheduler(id) => {
+                            // Start scheduler fade-out (2000ms) instead of immediate stop
+                            if ambient_states.contains_key(&id) && !scheduler_fading_out.contains_key(&id) {
+                                // Remove from regular fading if present
+                                fading_out.remove(&id);
+                                scheduler_fading_out.insert(id, 0.0);
+                            }
+                        }
+                        AudioCommand::UpdateAmbientSettingsScheduler { id, settings } => {
+                            if let Some(state) = ambient_states.get_mut(&id) {
+                                let pitch_changed = (state.settings.pitch - settings.pitch).abs() > 0.001;
+                                let pan_changed = (state.settings.pan - settings.pan).abs() > 0.001;
+                                let low_pass_changed = (state.settings.low_pass_freq - settings.low_pass_freq).abs() > 1.0;
+                                let reverb_changed = (state.settings.algorithmic_reverb - settings.algorithmic_reverb).abs() > 0.001
+                                    || state.settings.reverb_type != settings.reverb_type;
+                                state.settings = settings.clone();
+                                
+                                {
+                                    let mut active = active_ambients_clone.lock();
+                                    if let Some(info) = active.get_mut(&id) {
+                                        info.settings = settings;
+                                    }
+                                }
+                                
+                                if pitch_changed || pan_changed || low_pass_changed || reverb_changed {
+                                    state.sink.stop();
+                                    if let Ok(new_sink) = Sink::try_new(&stream_handle) {
+                                        let file_path = if state.is_playing_a {
+                                            &state.file_a
+                                        } else {
+                                            &state.file_b
+                                        };
+                                        let bytes = if let Some(cached) = audio_cache.get(file_path) {
+                                            Some(cached.clone())
+                                        } else {
+                                            File::open(file_path).ok().and_then(|mut f| {
+                                                let mut b = Vec::new();
+                                                f.read_to_end(&mut b).ok().map(|_| b)
+                                            })
+                                        };
+                                        if let Some(bytes) = bytes {
+                                        if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
+                                            let sample_rate = source.sample_rate();
+                                            let source = source.speed(state.settings.pitch).convert_samples::<f32>();
+                                            let source = PannedSource::new(source, state.settings.pan);
+                                            let source = LowPassSource::new(source, state.settings.low_pass_freq, sample_rate);
+                                            let effective_vol = calc_ambient_volume(
+                                                &state.settings, ambient_master_volume, master_volume,
+                                                is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                            );
+                                            new_sink.set_volume(effective_vol);
+                                            let source = ReverbSource::new(source, state.settings.algorithmic_reverb, sample_rate);
+                                            let source = AmbientAnalyzingSource::new(source, ambient_sample_buffer_clone.clone());
+                                            new_sink.append(source);
+                                            state.sink = new_sink;
+                                        }
+                                        }
+                                    }
+                                } else {
+                                    // Smooth volume transition with scheduler timing (2000ms)
+                                    let target_vol = calc_ambient_volume(
+                                        &state.settings, ambient_master_volume, master_volume,
+                                        is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                    );
+                                    let current_vol = scheduler_volume_transitions.get(&id)
+                                        .map(|(c, _)| *c)
+                                        .unwrap_or_else(|| state.sink.volume());
+                                    scheduler_volume_transitions.insert(id.clone(), (current_vol, target_vol));
+                                }
+                            }
+                        }
                     },
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         // Process fade-outs for sounds being stopped
@@ -1554,6 +1761,130 @@ impl AudioController {
                                 let mut active = active_ambients_clone.lock();
                                 active.remove(&id);
                             }
+                        }
+                        
+                        // Process fade-ins for newly started sounds
+                        let mut completed_fade_ins: Vec<String> = Vec::new();
+                        for (id, progress) in fading_in.iter_mut() {
+                            *progress += 1.0 / FADE_STEPS;
+                            if let Some(state) = ambient_states.get(id) {
+                                // Calculate faded volume (linear fade from 0 to target)
+                                let fade_multiplier = (*progress).min(1.0);
+                                let target_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                );
+                                state.sink.set_volume(target_vol * fade_multiplier);
+                            }
+                            if *progress >= 1.0 {
+                                completed_fade_ins.push(id.clone());
+                            }
+                        }
+                        // Remove completed fade-ins
+                        for id in completed_fade_ins {
+                            fading_in.remove(&id);
+                        }
+                        
+                        // Process smooth volume transitions for settings changes
+                        let mut completed_transitions: Vec<String> = Vec::new();
+                        for (id, (current_vol, target_vol)) in volume_transitions.iter_mut() {
+                            // Skip if sound is fading in (fade-in takes precedence)
+                            if fading_in.contains_key(id) {
+                                continue;
+                            }
+                            
+                            if let Some(state) = ambient_states.get(id) {
+                                // Interpolate toward target
+                                let diff = *target_vol - *current_vol;
+                                if diff.abs() < 0.01 {
+                                    // Close enough, snap to target
+                                    *current_vol = *target_vol;
+                                    state.sink.set_volume(*target_vol);
+                                    completed_transitions.push(id.clone());
+                                } else {
+                                    // Move toward target
+                                    *current_vol += diff.signum() * VOLUME_TRANSITION_SPEED.min(diff.abs());
+                                    state.sink.set_volume(*current_vol);
+                                }
+                            } else {
+                                completed_transitions.push(id.clone());
+                            }
+                        }
+                        // Remove completed transitions
+                        for id in completed_transitions {
+                            volume_transitions.remove(&id);
+                        }
+                        
+                        // Process SCHEDULER fade-outs (2000ms)
+                        let mut completed_scheduler_fades: Vec<String> = Vec::new();
+                        for (id, progress) in scheduler_fading_out.iter_mut() {
+                            *progress += 1.0 / SCHEDULER_FADE_STEPS;
+                            if let Some(state) = ambient_states.get(id) {
+                                let fade_multiplier = (1.0 - *progress).max(0.0);
+                                let base_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                );
+                                state.sink.set_volume(base_vol * fade_multiplier);
+                            }
+                            if *progress >= 1.0 {
+                                completed_scheduler_fades.push(id.clone());
+                            }
+                        }
+                        for id in completed_scheduler_fades {
+                            scheduler_fading_out.remove(&id);
+                            if let Some(state) = ambient_states.remove(&id) {
+                                state.sink.stop();
+                            }
+                            {
+                                let mut active = active_ambients_clone.lock();
+                                active.remove(&id);
+                            }
+                        }
+                        
+                        // Process SCHEDULER fade-ins (2000ms)
+                        let mut completed_scheduler_fade_ins: Vec<String> = Vec::new();
+                        for (id, progress) in scheduler_fading_in.iter_mut() {
+                            *progress += 1.0 / SCHEDULER_FADE_STEPS;
+                            if let Some(state) = ambient_states.get(id) {
+                                let fade_multiplier = (*progress).min(1.0);
+                                let target_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                );
+                                state.sink.set_volume(target_vol * fade_multiplier);
+                            }
+                            if *progress >= 1.0 {
+                                completed_scheduler_fade_ins.push(id.clone());
+                            }
+                        }
+                        for id in completed_scheduler_fade_ins {
+                            scheduler_fading_in.remove(&id);
+                        }
+                        
+                        // Process SCHEDULER volume transitions (2000ms)
+                        let mut completed_scheduler_transitions: Vec<String> = Vec::new();
+                        for (id, (current_vol, target_vol)) in scheduler_volume_transitions.iter_mut() {
+                            if scheduler_fading_in.contains_key(id) {
+                                continue;
+                            }
+                            
+                            if let Some(state) = ambient_states.get(id) {
+                                let diff = *target_vol - *current_vol;
+                                if diff.abs() < 0.01 {
+                                    *current_vol = *target_vol;
+                                    state.sink.set_volume(*target_vol);
+                                    completed_scheduler_transitions.push(id.clone());
+                                } else {
+                                    *current_vol += diff.signum() * SCHEDULER_VOLUME_TRANSITION_SPEED.min(diff.abs());
+                                    state.sink.set_volume(*current_vol);
+                                }
+                            } else {
+                                completed_scheduler_transitions.push(id.clone());
+                            }
+                        }
+                        for id in completed_scheduler_transitions {
+                            scheduler_volume_transitions.remove(&id);
                         }
                         
                         // A/B crossfade state machine - check each ambient sound
@@ -1767,6 +2098,10 @@ fn get_default_settings() -> AppSettings {
         music_crossfade_duration: 3.0,
         soundboard_duck_amount: 0.3,
         visualization_type: default_visualization(),
+        master_volume: default_volume(),
+        music_volume: default_volume(),
+        ambient_volume: default_volume(),
+        soundboard_volume: default_volume(),
     }
 }
 
@@ -1800,6 +2135,37 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
             .map_err(|e| format!("Failed to create settings directory: {}", e))?;
     }
     
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+    
+    fs::write(&settings_path, content)
+        .map_err(|e| format!("Failed to write settings: {}", e))
+}
+
+#[tauri::command]
+fn save_volume_setting(key: String, value: f32) -> Result<(), String> {
+    let settings_path = get_settings_path();
+    
+    // Load current settings
+    let mut settings: AppSettings = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .map_err(|e| format!("Failed to read settings: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse settings: {}", e))?
+    } else {
+        return Err("Settings file not found".to_string());
+    };
+    
+    // Update the specific volume field
+    match key.as_str() {
+        "master_volume" => settings.master_volume = value,
+        "music_volume" => settings.music_volume = value,
+        "ambient_volume" => settings.ambient_volume = value,
+        "soundboard_volume" => settings.soundboard_volume = value,
+        _ => return Err(format!("Unknown volume key: {}", key)),
+    }
+    
+    // Save updated settings
     let content = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     
@@ -1907,6 +2273,56 @@ fn scan_soundboard_folder(folder_path: String) -> Result<SoundboardData, String>
             path: folder_path,
         })
     }
+}
+
+#[tauri::command]
+fn update_soundboard_sound(
+    folder_path: String,
+    sound_id: String,
+    name: Option<String>,
+    hotkey: Option<String>,
+    color: Option<String>,
+    volume: Option<u32>,
+) -> Result<(), String> {
+    let path = PathBuf::from(&folder_path);
+    let metadata_path = path.join("metadata.json");
+    
+    if !metadata_path.exists() {
+        return Err("Metadata file not found".to_string());
+    }
+    
+    // Read existing metadata
+    let content = fs::read_to_string(&metadata_path)
+        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+    
+    let mut metadata: SoundboardMetadata = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse metadata: {}", e))?;
+    
+    // Find and update the sound
+    let sound = metadata.sounds.iter_mut().find(|s| s.id == sound_id);
+    if let Some(sound) = sound {
+        if let Some(new_name) = name {
+            sound.name = new_name;
+        }
+        if hotkey.is_some() {
+            sound.hotkey = hotkey;
+        }
+        if let Some(new_color) = color {
+            sound.color = Some(new_color);
+        }
+        if let Some(new_volume) = volume {
+            sound.volume = Some(new_volume);
+        }
+    } else {
+        return Err(format!("Sound with id {} not found", sound_id));
+    }
+    
+    // Write back to file
+    let content = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+    
+    fs::write(&metadata_path, content)
+        .map_err(|e| format!("Failed to write metadata: {}", e))
 }
 
 // Audio Commands - using thread-safe AudioController
@@ -2293,6 +2709,81 @@ fn set_ambient_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> 
     Ok(())
 }
 
+// Scheduler-specific commands with 2000ms fade times
+#[tauri::command]
+fn play_ambient_scheduler(
+    state: tauri::State<Arc<AudioController>>,
+    id: String,
+    file_a: String,
+    file_b: String,
+    volume: f32,
+    pitch: Option<f32>,
+    pan: Option<f32>,
+    low_pass_freq: Option<f32>,
+    reverb_type: Option<String>,
+    algorithmic_reverb: Option<f32>,
+    repeat_min: Option<u32>,
+    repeat_max: Option<u32>,
+    pause_min: Option<u32>,
+    pause_max: Option<u32>,
+    volume_variation: Option<f32>,
+) -> Result<(), String> {
+    let settings = AmbientSettings {
+        volume,
+        pitch: pitch.unwrap_or(1.0),
+        pan: pan.unwrap_or(0.0),
+        low_pass_freq: low_pass_freq.unwrap_or(22000.0),
+        reverb_type: reverb_type.unwrap_or_else(|| "off".to_string()),
+        algorithmic_reverb: algorithmic_reverb.unwrap_or(0.0),
+        repeat_min: repeat_min.unwrap_or(1),
+        repeat_max: repeat_max.unwrap_or(1),
+        pause_min: pause_min.unwrap_or(0),
+        pause_max: pause_max.unwrap_or(0),
+        volume_variation: volume_variation.unwrap_or(0.0),
+    };
+    state.send(AudioCommand::PlayAmbientScheduler { id, file_a, file_b, settings });
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_ambient_scheduler(state: tauri::State<Arc<AudioController>>, id: String) -> Result<(), String> {
+    state.send(AudioCommand::StopAmbientScheduler(id));
+    Ok(())
+}
+
+#[tauri::command]
+fn update_ambient_settings_scheduler(
+    state: tauri::State<Arc<AudioController>>,
+    id: String,
+    volume: f32,
+    pitch: Option<f32>,
+    pan: Option<f32>,
+    low_pass_freq: Option<f32>,
+    reverb_type: Option<String>,
+    algorithmic_reverb: Option<f32>,
+    repeat_min: Option<u32>,
+    repeat_max: Option<u32>,
+    pause_min: Option<u32>,
+    pause_max: Option<u32>,
+    volume_variation: Option<f32>,
+) -> Result<(), String> {
+    let settings = AmbientSettings {
+        volume,
+        pitch: pitch.unwrap_or(1.0),
+        pan: pan.unwrap_or(0.0),
+        low_pass_freq: low_pass_freq.unwrap_or(22000.0),
+        reverb_type: reverb_type.unwrap_or_else(|| "off".to_string()),
+        algorithmic_reverb: algorithmic_reverb.unwrap_or(0.0),
+        repeat_min: repeat_min.unwrap_or(1),
+        repeat_max: repeat_max.unwrap_or(1),
+        pause_min: pause_min.unwrap_or(0),
+        pause_max: pause_max.unwrap_or(0),
+        volume_variation: volume_variation.unwrap_or(0.0),
+    };
+    state.send(AudioCommand::UpdateAmbientSettingsScheduler { id, settings });
+    Ok(())
+}
+
 // === Playlist & Favorites Persistence ===
 
 fn get_playlists_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -2511,6 +3002,135 @@ fn delete_preset(app: tauri::AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
+// Schedule Preset Commands
+fn get_schedules_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let app_data = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let schedules_dir = app_data.join("Schedules");
+    
+    if !schedules_dir.exists() {
+        fs::create_dir_all(&schedules_dir)
+            .map_err(|e| format!("Failed to create schedules directory: {}", e))?;
+    }
+    
+    Ok(schedules_dir)
+}
+
+#[tauri::command]
+fn list_schedules(app: tauri::AppHandle) -> Result<Vec<SchedulePresetInfo>, String> {
+    let schedules_dir = get_schedules_dir(&app)?;
+    let mut schedules = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(&schedules_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map(|e| e == "schedule").unwrap_or(false) {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(schedule) = serde_json::from_str::<SchedulePreset>(&content) {
+                        schedules.push(SchedulePresetInfo {
+                            id: schedule.id,
+                            name: schedule.name,
+                            created: schedule.created,
+                            modified: schedule.modified,
+                            item_count: schedule.items.len(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort by name
+    schedules.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    
+    Ok(schedules)
+}
+
+#[tauri::command]
+fn save_schedule(app: tauri::AppHandle, name: String, items: Vec<ScheduledItem>) -> Result<SchedulePresetInfo, String> {
+    let schedules_dir = get_schedules_dir(&app)?;
+    
+    // Generate ID from name (sanitized filename)
+    let id: String = name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule_path = schedules_dir.join(format!("{}.schedule", &id));
+    
+    // Check if updating existing schedule
+    let (created, id) = if schedule_path.exists() {
+        if let Ok(content) = fs::read_to_string(&schedule_path) {
+            if let Ok(existing) = serde_json::from_str::<SchedulePreset>(&content) {
+                (existing.created, existing.id)
+            } else {
+                (now.clone(), id)
+            }
+        } else {
+            (now.clone(), id)
+        }
+    } else {
+        (now.clone(), id)
+    };
+    
+    let schedule = SchedulePreset {
+        id: id.clone(),
+        name: name.clone(),
+        created,
+        modified: now,
+        items: items.clone(),
+    };
+    
+    let content = serde_json::to_string_pretty(&schedule)
+        .map_err(|e| format!("Failed to serialize schedule: {}", e))?;
+    
+    fs::write(&schedule_path, content)
+        .map_err(|e| format!("Failed to write schedule file: {}", e))?;
+    
+    Ok(SchedulePresetInfo {
+        id: schedule.id,
+        name: schedule.name,
+        created: schedule.created,
+        modified: schedule.modified,
+        item_count: schedule.items.len(),
+    })
+}
+
+#[tauri::command]
+fn load_schedule(app: tauri::AppHandle, id: String) -> Result<SchedulePreset, String> {
+    let schedules_dir = get_schedules_dir(&app)?;
+    let schedule_path = schedules_dir.join(format!("{}.schedule", &id));
+    
+    if !schedule_path.exists() {
+        return Err(format!("Schedule '{}' not found", id));
+    }
+    
+    let content = fs::read_to_string(&schedule_path)
+        .map_err(|e| format!("Failed to read schedule file: {}", e))?;
+    
+    let schedule: SchedulePreset = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse schedule: {}", e))?;
+    
+    Ok(schedule)
+}
+
+#[tauri::command]
+fn delete_schedule(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let schedules_dir = get_schedules_dir(&app)?;
+    let schedule_path = schedules_dir.join(format!("{}.schedule", &id));
+    
+    if !schedule_path.exists() {
+        return Err(format!("Schedule '{}' not found", id));
+    }
+    
+    fs::remove_file(&schedule_path)
+        .map_err(|e| format!("Failed to delete schedule: {}", e))?;
+    
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct AudioDevice {
     id: String,
@@ -2561,9 +3181,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            save_volume_setting,
             scan_music_folder,
             scan_ambient_folder,
             scan_soundboard_folder,
+            update_soundboard_sound,
             init_audio,
             play_music,
             stop_music,
@@ -2601,11 +3223,18 @@ pub fn run() {
             update_ambient_settings,
             set_ambient_master_volume,
             set_ambient_muted,
+            play_ambient_scheduler,
+            stop_ambient_scheduler,
+            update_ambient_settings_scheduler,
             get_output_devices,
             list_presets,
             save_preset,
             load_preset,
-            delete_preset
+            delete_preset,
+            list_schedules,
+            save_schedule,
+            load_schedule,
+            delete_schedule
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

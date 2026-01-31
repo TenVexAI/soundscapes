@@ -8,11 +8,14 @@ import { useAudioStore } from './stores/audioStore';
 
 function App() {
   const { loadSettings } = useSettingsStore();
-  const { initAudio } = useAudioStore();
+  const { initAudio, loadVolumesFromSettings } = useAudioStore();
 
   useEffect(() => {
     const init = async () => {
-      await loadSettings();
+      const settings = await loadSettings();
+      if (settings) {
+        loadVolumesFromSettings(settings);
+      }
       await initAudio();
     };
     init();

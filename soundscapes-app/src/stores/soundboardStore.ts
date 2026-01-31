@@ -10,7 +10,9 @@ interface SoundboardState {
   
   loadSounds: (folderPath: string) => Promise<void>;
   playSound: (soundId: string) => void;
+  playSoundByHotkey: (hotkey: string) => void;
   updateSoundVolume: (soundId: string, volume: number) => void;
+  updateSound: (soundId: string, updates: Partial<Pick<SoundboardSound, 'name' | 'hotkey' | 'color'>>) => Promise<void>;
 }
 
 export const useSoundboardStore = create<SoundboardState>((set, get) => ({
@@ -86,11 +88,62 @@ export const useSoundboardStore = create<SoundboardState>((set, get) => ({
     }
   },
   
-  updateSoundVolume: (soundId: string, volume: number) => {
+  updateSoundVolume: async (soundId: string, volume: number) => {
+    const { folderPath } = get();
     set(state => ({
       sounds: state.sounds.map(s =>
         s.id === soundId ? { ...s, volume } : s
       ),
     }));
+    // Save volume to metadata.json
+    try {
+      await invoke('update_soundboard_sound', {
+        folderPath,
+        soundId,
+        volume,
+      });
+    } catch (error) {
+      console.error('Error saving soundboard volume:', error);
+    }
+  },
+  
+  playSoundByHotkey: (hotkey: string) => {
+    const { sounds, playSound } = get();
+    const sound = sounds.find(s => s.hotkey?.toLowerCase() === hotkey.toLowerCase());
+    if (sound) {
+      playSound(sound.id);
+    }
+  },
+  
+  updateSound: async (soundId: string, updates: Partial<Pick<SoundboardSound, 'name' | 'hotkey' | 'color'>>) => {
+    const { sounds, folderPath } = get();
+    const sound = sounds.find(s => s.id === soundId);
+    if (!sound) return;
+    
+    // Update local state immediately
+    set(state => ({
+      sounds: state.sounds.map(s =>
+        s.id === soundId ? { ...s, ...updates } : s
+      ),
+    }));
+    
+    // Save to metadata.json file
+    try {
+      await invoke('update_soundboard_sound', {
+        folderPath,
+        soundId,
+        name: updates.name,
+        hotkey: updates.hotkey,
+        color: updates.color,
+      });
+    } catch (error) {
+      console.error('Error saving soundboard sound:', error);
+      // Revert on error
+      set(state => ({
+        sounds: state.sounds.map(s =>
+          s.id === soundId ? sound : s
+        ),
+      }));
+    }
   },
 }));

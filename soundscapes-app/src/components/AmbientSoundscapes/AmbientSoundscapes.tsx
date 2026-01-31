@@ -1,7 +1,10 @@
-import React, { useState, useCallback, useEffect } from 'react';
-import { ChevronDown, ChevronRight, ChevronsUpDown, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw, Save, XCircle, FilePlus } from 'lucide-react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { ChevronDown, ChevronRight, ChevronsUpDown, Check, Square, Volume2, Eye, EyeOff, Trash2, Info, RotateCcw, Save, XCircle, FilePlus, Calendar } from 'lucide-react';
+import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { useAmbientStore } from '../../stores/ambientStore';
 import { usePresetStore } from '../../stores/presetStore';
+import { useSchedulerStore } from '../../stores/schedulerStore';
+import { Scheduler } from './Scheduler';
 import { AmbientSoundDef, AmbientSound, DEFAULT_AMBIENT_SETTINGS } from '../../types';
 
 // Info descriptions for each setting
@@ -327,6 +330,8 @@ export const AmbientSoundscapes: React.FC = () => {
     setHideUnselected,
     clearAll,
     syncActiveFromBackend,
+    transitionToSounds,
+    prepareFadeOut,
   } = useAmbientStore();
 
   const {
@@ -339,6 +344,8 @@ export const AmbientSoundscapes: React.FC = () => {
     setCurrentPresetId,
   } = usePresetStore();
 
+  const { stopSchedule, clearItems: clearSchedulerItems } = useSchedulerStore();
+
   const [showSaveNewDialog, setShowSaveNewDialog] = useState(false);
   const [presetName, setPresetName] = useState('');
   const [isSaving, setIsSaving] = useState(false);
@@ -347,6 +354,34 @@ export const AmbientSoundscapes: React.FC = () => {
   const [showOverwriteDialog, setShowOverwriteDialog] = useState(false);
   const [showSaveCurrentDialog, setShowSaveCurrentDialog] = useState(false);
   const [expandedSounds, setExpandedSounds] = useState<Set<string>>(new Set());
+  const [showScheduler, setShowScheduler] = useState(false);
+  const originalWidth = useRef<number | null>(null);
+
+  // Toggle scheduler and resize window
+  const toggleScheduler = useCallback(async () => {
+    const appWindow = getCurrentWindow();
+    try {
+      const scaleFactor = await appWindow.scaleFactor();
+      const physicalSize = await appWindow.innerSize();
+      // Convert physical to logical
+      const logicalWidth = physicalSize.width / scaleFactor;
+      const logicalHeight = physicalSize.height / scaleFactor;
+      
+      if (!showScheduler) {
+        // Opening scheduler - save original width and double it
+        originalWidth.current = logicalWidth;
+        await appWindow.setSize(new LogicalSize(logicalWidth * 2, logicalHeight));
+      } else {
+        // Closing scheduler - restore original width
+        const restoreWidth = originalWidth.current || logicalWidth / 2;
+        await appWindow.setSize(new LogicalSize(restoreWidth, logicalHeight));
+      }
+      setShowScheduler(!showScheduler);
+    } catch (error) {
+      console.error('Error resizing window:', error);
+      setShowScheduler(!showScheduler);
+    }
+  }, [showScheduler]);
 
   // Toggle a single sound's expanded state
   const toggleSoundExpanded = (soundId: string) => {
@@ -478,7 +513,7 @@ export const AmbientSoundscapes: React.FC = () => {
   };
 
   // Handle loading a preset
-  const handleLoadPreset = async (presetId: string) => {
+  const handleLoadPreset = useCallback(async (presetId: string) => {
     try {
       const preset = await loadPreset(presetId);
       
@@ -524,7 +559,7 @@ export const AmbientSoundscapes: React.FC = () => {
     } catch (error) {
       console.error('Error loading preset:', error);
     }
-  };
+  }, [loadPreset, clearAll, loadSoundWithSettings]);
 
   // Handle deleting a preset
   const handleDeletePreset = (presetId: string) => {
@@ -545,42 +580,116 @@ export const AmbientSoundscapes: React.FC = () => {
     }
   };
 
+  // Handle clearing all (including stopping scheduler)
+  const handleClearAll = useCallback(() => {
+    clearAll();
+    setCurrentPresetId(null);
+    stopSchedule();
+    clearSchedulerItems();
+  }, [clearAll, setCurrentPresetId, stopSchedule, clearSchedulerItems]);
+
+  // Handle clearing just ambient sounds (for scheduler use - doesn't clear scheduler items)
+  const handleClearAmbientOnly = useCallback(() => {
+    clearAll();
+    setCurrentPresetId(null);
+  }, [clearAll, setCurrentPresetId]);
+
+  // Handle loading a preset (stops scheduler) - for manual preset selection on left panel
+  const handleLoadPresetWithSchedulerStop = useCallback(async (presetId: string) => {
+    stopSchedule();
+    await handleLoadPreset(presetId);
+  }, [stopSchedule, handleLoadPreset]);
+
+  // Handle loading a preset for scheduler playback using smart transitions
+  // Only stops/starts sounds that differ between presets, keeps common sounds playing
+  const handleLoadPresetForScheduler = useCallback(async (presetId: string) => {
+    try {
+      const preset = await loadPreset(presetId);
+      
+      // Build the list of sounds from the preset
+      const newSounds: AmbientSound[] = preset.sounds.map(presetSound => ({
+        id: presetSound.soundId,
+        name: presetSound.name,
+        categoryId: presetSound.categoryId,
+        categoryPath: presetSound.categoryPath,
+        filesA: presetSound.filesA,
+        filesB: presetSound.filesB,
+        enabled: presetSound.enabled,
+        volume: presetSound.volume,
+        pitch: presetSound.pitch,
+        pan: presetSound.pan,
+        lowPassFreq: presetSound.lowPassFreq,
+        reverbType: DEFAULT_AMBIENT_SETTINGS.reverbType,
+        algorithmicReverb: presetSound.algorithmicReverb,
+        repeatRangeMin: presetSound.repeatRangeMin,
+        repeatRangeMax: presetSound.repeatRangeMax,
+        pauseRangeMin: presetSound.pauseRangeMin,
+        pauseRangeMax: presetSound.pauseRangeMax,
+        volumeVariation: presetSound.volumeVariation,
+      }));
+      
+      // Use smart transition - only stop/start what's needed
+      await transitionToSounds(newSounds);
+    } catch (error) {
+      console.error('Error loading preset for scheduler:', error);
+    }
+  }, [loadPreset, transitionToSounds]);
+
+  // Prepare fade out 2 seconds before transition - gets next preset's sound IDs
+  const handlePrepareFadeOut = useCallback(async (nextPresetId: string) => {
+    try {
+      const preset = await loadPreset(nextPresetId);
+      const nextSoundIds = new Set(preset.sounds.map(s => s.soundId));
+      await prepareFadeOut(nextSoundIds);
+    } catch (error) {
+      console.error('Error preparing fade out:', error);
+    }
+  }, [loadPreset, prepareFadeOut]);
+
   return (
-    <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
-      <div className="flex items-center justify-between border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
-        <h2 className="text-lg font-semibold text-text-primary">Ambient Sounds</h2>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setHideUnselected(!hideUnselected)}
-            className={`p-2 rounded-lg transition-colors ${
-              hideUnselected ? 'text-accent-cyan' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
-            }`}
-            title={hideUnselected ? 'Show all sounds' : 'Hide unselected'}
-          >
-            {hideUnselected ? <Eye size={20} /> : <EyeOff size={20} />}
-          </button>
-          <button
-            onClick={() => allSoundsExpanded ? collapseAllSounds() : expandAllSounds()}
-            disabled={activeSounds.size === 0}
-            className={`p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-              allSoundsExpanded ? 'text-accent-purple' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
-            }`}
-            title={allSoundsExpanded ? 'Collapse all settings' : 'Expand all settings'}
-          >
-            <ChevronsUpDown size={20} />
-          </button>
-          <button
-            onClick={() => {
-              clearAll();
-              setCurrentPresetId(null);
-            }}
-            className="p-2 rounded-lg text-text-secondary hover:text-accent-red hover:bg-bg-secondary transition-colors"
-            title="Clear all"
-          >
-            <XCircle size={20} />
-          </button>
+    <div className="flex h-full">
+      {/* Left Panel - Ambient Sounds */}
+      <div className="flex flex-col h-full flex-1" style={{ padding: '8px 8px 8px 10px' }}>
+        <div className="flex items-center justify-between border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
+          <h2 className="text-lg font-semibold text-text-primary">Ambient Sounds</h2>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setHideUnselected(!hideUnselected)}
+              className={`p-2 rounded-lg transition-colors ${
+                hideUnselected ? 'text-accent-cyan' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+              }`}
+              title={hideUnselected ? 'Show all sounds' : 'Hide unselected'}
+            >
+              {hideUnselected ? <Eye size={20} /> : <EyeOff size={20} />}
+            </button>
+            <button
+              onClick={() => allSoundsExpanded ? collapseAllSounds() : expandAllSounds()}
+              disabled={activeSounds.size === 0}
+              className={`p-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                allSoundsExpanded ? 'text-accent-purple' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+              }`}
+              title={allSoundsExpanded ? 'Collapse all settings' : 'Expand all settings'}
+            >
+              <ChevronsUpDown size={20} />
+            </button>
+            <button
+              onClick={handleClearAll}
+              className="p-2 rounded-lg text-text-secondary hover:text-accent-red hover:bg-bg-secondary transition-colors"
+              title="Clear all"
+            >
+              <XCircle size={20} />
+            </button>
+            <button
+              onClick={toggleScheduler}
+              className={`p-2 rounded-lg transition-colors ${
+                showScheduler ? 'text-accent-purple bg-accent-purple/20' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+              }`}
+              title={showScheduler ? 'Hide scheduler' : 'Show scheduler'}
+            >
+              <Calendar size={20} />
+            </button>
+          </div>
         </div>
-      </div>
 
       {/* Preset Controls */}
       <div className="flex items-center gap-2 border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
@@ -588,7 +697,7 @@ export const AmbientSoundscapes: React.FC = () => {
           value={currentPresetId || ''}
           onChange={(e) => {
             if (e.target.value) {
-              handleLoadPreset(e.target.value);
+              handleLoadPresetWithSchedulerStop(e.target.value);
             } else {
               setCurrentPresetId(null);
             }
@@ -880,6 +989,18 @@ export const AmbientSoundscapes: React.FC = () => {
               </button>
             </div>
           </div>
+        </div>
+      )}
+      </div>
+
+      {/* Right Panel - Scheduler */}
+      {showScheduler && (
+        <div className="flex-1 h-full">
+          <Scheduler
+            onLoadPreset={handleLoadPresetForScheduler}
+            onClearAmbient={handleClearAmbientOnly}
+            onPrepareFadeOut={handlePrepareFadeOut}
+          />
         </div>
       )}
     </div>
