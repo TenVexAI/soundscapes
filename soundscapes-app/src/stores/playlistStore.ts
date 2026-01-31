@@ -78,7 +78,7 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   currentPlaylistId: null,
   currentIndex: -1,
   isShuffled: false,
-  isLooping: false,
+  isLooping: true,
   favorites: new Set(),
   isLoading: false,
   playNextQueue: [],
@@ -113,6 +113,12 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
       // Load playlist state from backend (now includes persisted favorites)
       const backendState = await invoke<BackendPlaylistState>('get_playlist_state');
       const customPlaylists = await invoke<MusicPlaylist[]>('get_playlists');
+      
+      // Set loop to true by default on startup
+      if (!backendState.isLooping) {
+        await invoke('set_playlist_loop', { looping: true });
+        backendState.isLooping = true;
+      }
       
       // Build auto playlists
       const allMusicPlaylist: MusicPlaylist = {
@@ -202,11 +208,36 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   },
   
   playNext: async () => {
-    const { playNextQueue, currentPlaylistId, currentIndex, isShuffled, isLooping, interruptedIndex, playlists } = get();
+    const { playNextQueue, currentPlaylistId, currentIndex, isShuffled, isLooping, interruptedIndex, playlists, albums } = get();
+    
+    // Helper to get current playlist or album
+    const getCurrentPlaylistOrAlbum = (): { tracks: PlaylistTrack[] } | null => {
+      if (!currentPlaylistId) return null;
+      
+      if (currentPlaylistId.startsWith('album-')) {
+        const albumName = currentPlaylistId.replace('album-', '');
+        const album = albums.find(a => a.name === albumName);
+        if (album) {
+          return {
+            tracks: album.tracks.map(t => ({
+              id: t.id,
+              file: t.file,
+              title: t.title,
+              artist: t.artist,
+              album: album.name,
+              albumPath: album.path,
+            })),
+          };
+        }
+        return null;
+      }
+      
+      return playlists.find(p => p.id === currentPlaylistId) || null;
+    };
     
     // Check if we need to resume from interrupted position
     if (interruptedIndex !== null) {
-      const playlist = playlists.find(p => p.id === currentPlaylistId);
+      const playlist = getCurrentPlaylistOrAlbum();
       if (playlist) {
         const resumeIndex = (interruptedIndex + 1) % playlist.tracks.length;
         await invoke('set_playlist_index', { index: resumeIndex });
@@ -224,8 +255,8 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
       return;
     }
     
-    // Continue with current playlist
-    const playlist = playlists.find(p => p.id === currentPlaylistId);
+    // Continue with current playlist or album
+    const playlist = getCurrentPlaylistOrAlbum();
     if (!playlist || playlist.tracks.length === 0) return;
     
     let nextIndex: number;
@@ -249,9 +280,34 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   },
   
   playPrevious: async () => {
-    const { currentPlaylistId, currentIndex, playlists } = get();
+    const { currentPlaylistId, currentIndex, playlists, albums } = get();
     
-    const playlist = playlists.find(p => p.id === currentPlaylistId);
+    // Helper to get current playlist or album
+    const getCurrentPlaylistOrAlbum = (): { tracks: PlaylistTrack[] } | null => {
+      if (!currentPlaylistId) return null;
+      
+      if (currentPlaylistId.startsWith('album-')) {
+        const albumName = currentPlaylistId.replace('album-', '');
+        const album = albums.find(a => a.name === albumName);
+        if (album) {
+          return {
+            tracks: album.tracks.map(t => ({
+              id: t.id,
+              file: t.file,
+              title: t.title,
+              artist: t.artist,
+              album: album.name,
+              albumPath: album.path,
+            })),
+          };
+        }
+        return null;
+      }
+      
+      return playlists.find(p => p.id === currentPlaylistId) || null;
+    };
+    
+    const playlist = getCurrentPlaylistOrAlbum();
     if (!playlist || playlist.tracks.length === 0) return;
     
     const prevIndex = currentIndex <= 0 ? playlist.tracks.length - 1 : currentIndex - 1;

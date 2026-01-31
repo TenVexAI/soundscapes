@@ -22,10 +22,12 @@ interface PlaylistTrack {
 interface TrackItemProps {
   track: PlaylistTrack;
   isFavorite: boolean;
-  onPlay: () => void;
+  onPlay?: () => void;
   onPlayNext: () => void;
   onPlayNow: () => void;
   onToggleFavorite: () => void;
+  showPlayFromPlaylist?: boolean;
+  playFromLabel?: string;
 }
 
 const TrackItem: React.FC<TrackItemProps> = ({
@@ -35,6 +37,8 @@ const TrackItem: React.FC<TrackItemProps> = ({
   onPlayNext,
   onPlayNow,
   onToggleFavorite,
+  showPlayFromPlaylist = true,
+  playFromLabel = 'Play from playlist',
 }) => (
   <div className="flex items-center gap-2 p-2 rounded-lg hover:bg-bg-secondary/50 group">
     <button
@@ -65,13 +69,15 @@ const TrackItem: React.FC<TrackItemProps> = ({
       >
         <Play size={16} />
       </button>
-      <button
-        onClick={onPlay}
-        className="p-1.5 rounded text-text-secondary hover:text-accent-purple hover:bg-bg-secondary"
-        title="Play from playlist"
-      >
-        <ListPlus size={16} />
-      </button>
+      {showPlayFromPlaylist && onPlay && (
+        <button
+          onClick={onPlay}
+          className="p-1.5 rounded text-text-secondary hover:text-accent-purple hover:bg-bg-secondary"
+          title={playFromLabel}
+        >
+          <ListPlus size={16} />
+        </button>
+      )}
     </div>
   </div>
 );
@@ -271,7 +277,22 @@ export const MusicPlaylist: React.FC = () => {
     setSelectedTracks(newSelected);
   };
 
-  const currentPlaylist = playlists.find(p => p.id === currentPlaylistId);
+  // Handle both playlists and albums for current playlist display
+  const getCurrentPlaylistOrAlbum = () => {
+    if (!currentPlaylistId) return null;
+    
+    if (currentPlaylistId.startsWith('album-')) {
+      const albumName = currentPlaylistId.replace('album-', '');
+      const album = albums.find(a => a.name === albumName);
+      if (album) {
+        return { id: currentPlaylistId, name: album.name, isAuto: true, tracks: [] };
+      }
+    }
+    
+    return playlists.find(p => p.id === currentPlaylistId);
+  };
+  
+  const currentPlaylist = getCurrentPlaylistOrAlbum();
   
   // Handle both playlists and albums in selection
   const getSelectedPlaylistOrAlbum = () => {
@@ -306,9 +327,9 @@ export const MusicPlaylist: React.FC = () => {
   return (
     <div className="flex flex-col h-full" style={{ padding: '8px 8px 8px 10px' }}>
       {/* Header with controls */}
-      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
+      <div className="flex items-center justify-between border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
         <h2 className="text-lg font-semibold text-text-primary">Music</h2>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-2">
           <button
             onClick={async () => {
               await invoke('stop_music');
@@ -341,12 +362,12 @@ export const MusicPlaylist: React.FC = () => {
       </div>
 
       {/* Playlist selector */}
-      <div className="mb-3">
-        <div className="flex items-center gap-2 mb-2">
+      <div className="border-b border-border" style={{ paddingBottom: '6px', marginBottom: '6px' }}>
+        <div className="flex items-center gap-2">
           <select
             value={selectedPlaylistId || ''}
             onChange={(e) => setSelectedPlaylistId(e.target.value || null)}
-            className="flex-1 bg-bg-secondary text-text-primary text-sm rounded-lg p-2 border border-border"
+            className="flex-1 px-2 py-1.5 bg-bg-secondary border border-border rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent-purple"
           >
             <option value="">Library View</option>
             <optgroup label="Playlists">
@@ -371,7 +392,7 @@ export const MusicPlaylist: React.FC = () => {
               setSelectedPlaylistId(null); // Switch to Library View
             }}
             className={`p-2 rounded-lg transition-colors ${
-              isSelectMode ? 'text-accent-green' : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+              isSelectMode ? 'text-accent-green' : 'text-text-secondary hover:text-accent-green hover:bg-bg-secondary'
             }`}
             title="Create playlist"
           >
@@ -381,7 +402,7 @@ export const MusicPlaylist: React.FC = () => {
         
         {/* Current playlist indicator */}
         {currentPlaylist && (
-          <div className="flex items-center gap-2 px-2 py-1.5 bg-accent-purple/10 rounded-lg text-sm">
+          <div className="flex items-center gap-2 px-2 py-1.5 bg-accent-purple/10 rounded-lg text-sm" style={{ marginTop: '8px' }}>
             <Music size={14} className="text-accent-purple" />
             <span className="text-text-secondary">Playing:</span>
             <span className="text-text-primary font-medium truncate">{currentPlaylist.name}</span>
@@ -433,13 +454,14 @@ export const MusicPlaylist: React.FC = () => {
           // Playlist view
           <div>
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-medium text-text-primary">{selectedPlaylist.name}</h3>
-              <div className="flex items-center gap-1">
+              <h3 className="font-medium text-text-primary" style={{ fontSize: '15px' }}>{selectedPlaylist.name}</h3>
+              <div className="flex items-center" style={{ gap: '8px' }}>
                 {currentPlaylistId !== selectedPlaylistId && selectedPlaylist && selectedPlaylist.tracks.length > 0 && (
                   <button
                     onClick={async () => {
                       if (selectedPlaylistId.startsWith('album-')) {
-                        // For albums, just play the first track
+                        // For albums, set the album as current and play the first track
+                        await setCurrentPlaylist(selectedPlaylistId);
                         await playTrack(selectedPlaylist.tracks[0]);
                       } else {
                         // For playlists, set the playlist and play from index 0
@@ -458,7 +480,7 @@ export const MusicPlaylist: React.FC = () => {
                       className="p-1 text-text-secondary hover:text-accent-cyan"
                       title="Edit playlist"
                     >
-                      <Pencil size={14} />
+                      <Pencil size={16} />
                     </button>
                     <button
                       onClick={() => {
@@ -468,7 +490,7 @@ export const MusicPlaylist: React.FC = () => {
                       className="p-1 text-text-secondary hover:text-accent-red"
                       title="Delete playlist"
                     >
-                      <Trash2 size={14} />
+                      <Trash2 size={16} />
                     </button>
                   </>
                 )}
@@ -483,10 +505,21 @@ export const MusicPlaylist: React.FC = () => {
                     key={track.id}
                     track={track}
                     isFavorite={favorites.has(track.id)}
-                    onPlay={() => playTrackFromPlaylist(selectedPlaylistId, index)}
+                    onPlay={async () => {
+                      if (selectedPlaylistId?.startsWith('album-')) {
+                        // For albums, set the album as current with correct index and play the track
+                        await setCurrentPlaylist(selectedPlaylistId);
+                        await invoke('set_playlist_index', { index });
+                        usePlaylistStore.setState({ currentIndex: index });
+                        await playTrack(track);
+                      } else {
+                        playTrackFromPlaylist(selectedPlaylistId, index);
+                      }
+                    }}
                     onPlayNext={() => addToPlayNextQueue(track)}
                     onPlayNow={() => playNow(track)}
                     onToggleFavorite={() => toggleFavorite(track.id)}
+                    playFromLabel={selectedPlaylistId?.startsWith('album-') ? 'Play from album' : 'Play from playlist'}
                   />
                 ))}
               </div>
@@ -546,10 +579,10 @@ export const MusicPlaylist: React.FC = () => {
                         key={track.id}
                         track={fullTrack}
                         isFavorite={favorites.has(track.id)}
-                        onPlay={() => playTrack(fullTrack)}
                         onPlayNext={() => addToPlayNextQueue(fullTrack)}
                         onPlayNow={() => playNow(fullTrack)}
                         onToggleFavorite={() => toggleFavorite(track.id)}
+                        showPlayFromPlaylist={false}
                       />
                     );
                   })}
