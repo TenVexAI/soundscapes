@@ -178,7 +178,7 @@ export const Scheduler: React.FC<SchedulerProps> = ({ onLoadPreset, onClearAmbie
     clearItems,
     startSchedule,
     stopSchedule,
-    tick,
+    syncWithBackend,
   } = useSchedulerStore();
 
   const { presets, loadPresets } = usePresetStore();
@@ -198,16 +198,18 @@ export const Scheduler: React.FC<SchedulerProps> = ({ onLoadPreset, onClearAmbie
   // Track if we've already prepared fade out for current transition
   const fadeOutPreparedRef = useRef<number | null>(null);
 
-  // Timer tick for playback
+  // Poll backend state for real-time updates
   useEffect(() => {
-    if (!isPlaying) return;
+    // Initial sync
+    syncWithBackend();
     
+    // Poll backend every second for timer updates
     const interval = setInterval(() => {
-      tick();
+      syncWithBackend();
     }, 1000);
     
     return () => clearInterval(interval);
-  }, [isPlaying, tick]);
+  }, [syncWithBackend]);
 
   // Prepare fade out 2 seconds before transition
   useEffect(() => {
