@@ -342,6 +342,7 @@ export const AmbientSoundscapes: React.FC = () => {
     loadPreset,
     deletePreset,
     setCurrentPresetId,
+    syncCurrentPresetId,
   } = usePresetStore();
 
   const { stopSchedule, clearItems: clearSchedulerItems, isPlaying: isSchedulePlaying, syncWithBackend: syncSchedulerWithBackend } = useSchedulerStore();
@@ -472,6 +473,18 @@ export const AmbientSoundscapes: React.FC = () => {
     }
   }, [categories, syncActiveFromBackend]);
 
+  // Poll backend for active sounds and preset ID to stay in sync with main window changes
+  useEffect(() => {
+    if (categories.length === 0) return;
+    
+    const interval = setInterval(() => {
+      syncActiveFromBackend();
+      syncCurrentPresetId();
+    }, 500); // Poll every 500ms for responsive UI updates
+    
+    return () => clearInterval(interval);
+  }, [categories.length, syncActiveFromBackend, syncCurrentPresetId]);
+
   // Check if preset name already exists
   const getExistingPresetByName = (name: string) => {
     const normalizedName = name.trim().toLowerCase();
@@ -485,7 +498,14 @@ export const AmbientSoundscapes: React.FC = () => {
 
   // Handle "Save New" - create a new preset
   const handleSaveNew = async () => {
-    if (!presetName.trim() || activeSounds.size === 0) return;
+    if (!presetName.trim()) {
+      console.warn('Cannot save: preset name is empty');
+      return;
+    }
+    if (activeSounds.size === 0) {
+      console.warn('Cannot save: no active sounds');
+      return;
+    }
     
     // Check if a preset with this name already exists
     const existingPreset = getExistingPresetByName(presetName);
@@ -786,7 +806,7 @@ export const AmbientSoundscapes: React.FC = () => {
             />
             <button
               onClick={handleSaveNew}
-              disabled={!presetName.trim() || isSaving}
+              disabled={!presetName.trim() || isSaving || activeSounds.size === 0}
               className="px-3 py-1.5 bg-accent-green text-bg-primary rounded text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
             >
               {isSaving ? '...' : 'Save'}

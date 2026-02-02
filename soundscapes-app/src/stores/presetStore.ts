@@ -47,7 +47,8 @@ interface PresetState {
   savePreset: (name: string, sounds: Map<string, AmbientSound>) => Promise<PresetInfo>;
   loadPreset: (id: string) => Promise<SoundscapePreset>;
   deletePreset: (id: string) => Promise<void>;
-  setCurrentPresetId: (id: string | null) => void;
+  setCurrentPresetId: (id: string | null) => Promise<void>;
+  syncCurrentPresetId: () => Promise<void>;
 }
 
 // Convert AmbientSound to PresetSound format
@@ -95,6 +96,8 @@ export const usePresetStore = create<PresetState>((set, get) => ({
     
     // Refresh the preset list
     await get().loadPresets();
+    // Sync to backend for cross-window sync
+    await invoke('set_current_preset_id', { id: result.id });
     set({ currentPresetId: result.id });
     
     return result;
@@ -102,6 +105,8 @@ export const usePresetStore = create<PresetState>((set, get) => ({
   
   loadPreset: async (id: string) => {
     const preset = await invoke<SoundscapePreset>('load_preset', { id });
+    // Sync to backend for cross-window sync
+    await invoke('set_current_preset_id', { id });
     set({ currentPresetId: id });
     return preset;
   },
@@ -111,6 +116,7 @@ export const usePresetStore = create<PresetState>((set, get) => ({
     
     // Clear current if deleted
     if (get().currentPresetId === id) {
+      await invoke('set_current_preset_id', { id: null });
       set({ currentPresetId: null });
     }
     
@@ -118,7 +124,18 @@ export const usePresetStore = create<PresetState>((set, get) => ({
     await get().loadPresets();
   },
   
-  setCurrentPresetId: (id: string | null) => {
+  setCurrentPresetId: async (id: string | null) => {
+    // Sync to backend for cross-window sync
+    await invoke('set_current_preset_id', { id });
     set({ currentPresetId: id });
+  },
+
+  syncCurrentPresetId: async () => {
+    try {
+      const id = await invoke<string | null>('get_current_preset_id');
+      set({ currentPresetId: id });
+    } catch (error) {
+      console.warn('Failed to sync current preset id:', error);
+    }
   },
 }));

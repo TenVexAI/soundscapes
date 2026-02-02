@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Square, Repeat, Shuffle, Music, Waves, ChevronDown } from 'lucide-react';
+import { Square, Repeat, Shuffle, Music, Waves, ChevronDown, XCircle } from 'lucide-react';
 import { usePlaylistStore } from '../../stores/playlistStore';
 import { usePresetStore } from '../../stores/presetStore';
 import { useSchedulerStore } from '../../stores/schedulerStore';
@@ -29,9 +29,9 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
     loadAlbums,
   } = usePlaylistStore();
 
-  const { presets, loadPresets, currentPresetId } = usePresetStore();
+  const { presets, loadPresets, currentPresetId, setCurrentPresetId, syncCurrentPresetId } = usePresetStore();
   const { schedules, loadSchedules, isPlaying: isSchedulePlaying, stopSchedule } = useSchedulerStore();
-  const { clearAll: clearAmbient } = useAmbientStore();
+  const { clearAll: clearAmbient, activeSounds, syncActiveFromBackend } = useAmbientStore();
   const { settings } = useSettingsStore();
 
   const [musicDropdownOpen, setMusicDropdownOpen] = useState(false);
@@ -42,6 +42,15 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
     loadPresets();
     loadSchedules();
   }, [loadPresets, loadSchedules]);
+
+  // Poll for currentPresetId and active sounds from other windows
+  useEffect(() => {
+    const interval = setInterval(() => {
+      syncCurrentPresetId();
+      syncActiveFromBackend();
+    }, 500);
+    return () => clearInterval(interval);
+  }, [syncCurrentPresetId, syncActiveFromBackend]);
 
   // Load albums if not already loaded
   useEffect(() => {
@@ -73,6 +82,9 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
     return playlist?.name || 'Music';
   };
 
+  // Check if any ambient sounds are actively playing
+  const hasActiveSounds = activeSounds.size > 0;
+
   // Get display name for current ambient selection
   const getAmbientDisplayName = () => {
     if (isSchedulePlaying) {
@@ -82,8 +94,14 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
       const preset = presets.find(p => p.id === currentPresetId);
       return preset?.name || 'Soundscape';
     }
+    if (hasActiveSounds) {
+      return 'Sounds Playing';
+    }
     return 'Soundscape';
   };
+
+  // Determine if dropdown should be purple (schedule playing, preset playing, or sounds active)
+  const isAmbientActive = isSchedulePlaying || currentPresetId !== null || hasActiveSounds;
 
   // Handle music selection
   const handleMusicSelect = async (type: 'playlist' | 'album', id: string) => {
@@ -111,17 +129,13 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
     }
   };
 
-  // Stop all playback
-  const handleStopAll = async () => {
+  // Stop music playback only
+  const handleStopMusic = async () => {
     try {
       await invoke('stop_music');
       await setCurrentPlaylist(null);
-      if (isSchedulePlaying) {
-        stopSchedule();
-      }
-      await clearAmbient();
     } catch (error) {
-      console.error('Error stopping all:', error);
+      console.error('Error stopping music:', error);
     }
   };
 
@@ -135,7 +149,11 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
             setMusicDropdownOpen(!musicDropdownOpen);
             setAmbientDropdownOpen(false);
           }}
-          className="flex items-center gap-1 px-2 py-1 rounded-lg text-text-secondary/60 hover:text-accent-cyan hover:bg-bg-secondary/50 transition-colors text-xs"
+          className={`flex items-center gap-1 px-2 py-1 rounded-lg transition-colors text-xs ${
+            currentPlaylistId 
+              ? 'text-accent-cyan' 
+              : 'text-text-secondary/60 hover:text-accent-cyan hover:bg-bg-secondary/50'
+          }`}
           title="Select playlist or album"
         >
           <Music size={14} />
@@ -188,11 +206,11 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
         )}
       </div>
 
-      {/* Stop All Button */}
+      {/* Stop Music Button */}
       <button
-        onClick={handleStopAll}
+        onClick={handleStopMusic}
         className="p-1.5 rounded-lg text-text-secondary/60 hover:text-accent-red hover:bg-bg-secondary/50 transition-colors"
-        title="Stop all"
+        title="Stop music"
       >
         <Square size={14} />
       </button>
@@ -223,8 +241,12 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
         <Shuffle size={14} />
       </button>
 
-      {/* Ambient Dropdown */}
-      <div className="relative quick-controls-dropdown" style={{ marginLeft: '4px', marginRight: '4px' }}>
+      {/* Divider between playlist controls and soundscapes */}
+      <span className="text-text-secondary/30" style={{ marginLeft: '12px', marginRight: '12px' }}>|</span>
+
+      {/* Ambient Dropdown + Clear Button Container */}
+      <div className="flex items-center gap-1" style={{ marginRight: '12px' }}>
+      <div className="relative quick-controls-dropdown">
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -232,9 +254,9 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
             setMusicDropdownOpen(false);
           }}
           className="flex items-center gap-1 px-2 py-1 rounded-lg transition-colors text-xs"
-          style={{ color: isSchedulePlaying ? '#a855f7' : 'rgba(156, 163, 175, 0.6)' }}
-          onMouseEnter={(e) => { if (!isSchedulePlaying) e.currentTarget.style.color = '#a855f7'; }}
-          onMouseLeave={(e) => { if (!isSchedulePlaying) e.currentTarget.style.color = 'rgba(156, 163, 175, 0.6)'; }}
+          style={{ color: isAmbientActive ? '#a855f7' : 'rgba(156, 163, 175, 0.6)' }}
+          onMouseEnter={(e) => { if (!isAmbientActive) e.currentTarget.style.color = '#a855f7'; }}
+          onMouseLeave={(e) => { if (!isAmbientActive) e.currentTarget.style.color = 'rgba(156, 163, 175, 0.6)'; }}
           title="Select soundscape or schedule"
         >
           <Waves size={14} />
@@ -288,6 +310,23 @@ export const QuickControls: React.FC<QuickControlsProps> = ({
             )}
           </div>
         )}
+      </div>
+
+      {/* Clear Soundscapes Button */}
+      <button
+        onClick={async (e) => {
+          e.stopPropagation();
+          if (isSchedulePlaying) {
+            stopSchedule();
+          }
+          await clearAmbient();
+          setCurrentPresetId(null);
+        }}
+        className="p-1 rounded text-text-secondary/60 hover:text-accent-red hover:bg-bg-secondary/50 transition-colors"
+        title="Clear all soundscapes"
+      >
+        <XCircle size={14} />
+      </button>
       </div>
     </div>
   );

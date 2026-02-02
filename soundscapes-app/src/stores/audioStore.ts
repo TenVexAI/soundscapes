@@ -54,12 +54,15 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   },
   
   loadVolumesFromSettings: (settings: AppSettings) => {
+    const soundboardVol = settings.soundboard_volume ?? 50;
     set({
       masterVolume: settings.master_volume ?? 50,
       musicVolume: settings.music_volume ?? 50,
       ambientVolume: settings.ambient_volume ?? 50,
-      soundboardVolume: settings.soundboard_volume ?? 50,
+      soundboardVolume: soundboardVol,
     });
+    // Sync soundboard volume to backend
+    invoke('set_soundboard_volume', { volume: soundboardVol / 100 }).catch(console.error);
   },
   
   setMasterVolume: (volume: number, save = true) => {
@@ -87,7 +90,7 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   },
   
   setSoundboardVolume: (volume: number, save = true) => {
-    // TODO: Implement soundboard volume in Rust backend
+    invoke('set_soundboard_volume', { volume: volume / 100 }).catch(console.error);
     set({ soundboardVolume: volume });
     if (save) {
       invoke('save_volume_setting', { key: 'soundboard_volume', value: volume }).catch(console.error);
@@ -114,7 +117,7 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   
   toggleSoundboardMute: () => {
     const { isSoundboardMuted } = get();
-    // TODO: Implement soundboard mute in Rust backend
+    invoke('set_soundboard_muted', { muted: !isSoundboardMuted }).catch(console.error);
     set({ isSoundboardMuted: !isSoundboardMuted });
   },
 }));

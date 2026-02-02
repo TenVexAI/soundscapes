@@ -80,54 +80,53 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
     // Query backend for currently playing ambient sounds and restore UI state
     try {
       const activeInfos = await invoke<ActiveAmbientInfo[]>('get_active_ambients');
-      if (activeInfos.length > 0) {
-        const { categories } = get();
-        const newActiveSounds = new Map<string, AmbientSound>();
+      const { categories } = get();
+      const newActiveSounds = new Map<string, AmbientSound>();
+      
+      for (const info of activeInfos) {
+        // Find the sound definition in categories to get name and category info
+        let soundName = info.id;
+        let categoryId = '';
+        let categoryPath = '';
+        let filesA = '';
+        let filesB = '';
         
-        for (const info of activeInfos) {
-          // Find the sound definition in categories to get name and category info
-          let soundName = info.id;
-          let categoryId = '';
-          let categoryPath = '';
-          let filesA = '';
-          let filesB = '';
-          
-          for (const category of categories) {
-            const soundDef = category.sounds.find(s => s.id === info.id);
-            if (soundDef) {
-              soundName = soundDef.name;
-              categoryId = category.name;
-              categoryPath = category.path;
-              filesA = soundDef.files.a;
-              filesB = soundDef.files.b;
-              break;
-            }
+        for (const category of categories) {
+          const soundDef = category.sounds.find(s => s.id === info.id);
+          if (soundDef) {
+            soundName = soundDef.name;
+            categoryId = category.name;
+            categoryPath = category.path;
+            filesA = soundDef.files.a;
+            filesB = soundDef.files.b;
+            break;
           }
-          
-          newActiveSounds.set(info.id, {
-            id: info.id,
-            name: soundName,
-            categoryId,
-            categoryPath,
-            filesA,
-            filesB,
-            enabled: true,
-            volume: info.settings.volume,
-            pitch: info.settings.pitch,
-            pan: info.settings.pan,
-            lowPassFreq: info.settings.low_pass_freq,
-            reverbType: info.settings.reverb_type as AmbientSound['reverbType'],
-            algorithmicReverb: info.settings.algorithmic_reverb,
-            repeatRangeMin: info.settings.repeat_min,
-            repeatRangeMax: info.settings.repeat_max,
-            pauseRangeMin: info.settings.pause_min,
-            pauseRangeMax: info.settings.pause_max,
-            volumeVariation: info.settings.volume_variation,
-          });
         }
         
-        set({ activeSounds: newActiveSounds });
+        newActiveSounds.set(info.id, {
+          id: info.id,
+          name: soundName,
+          categoryId,
+          categoryPath,
+          filesA,
+          filesB,
+          enabled: true,
+          volume: Math.round(info.settings.volume * 100), // Convert 0-1 to 0-100
+          pitch: info.settings.pitch,
+          pan: Math.round(info.settings.pan * 100), // Convert -1..1 to -100..100
+          lowPassFreq: info.settings.low_pass_freq,
+          reverbType: info.settings.reverb_type as AmbientSound['reverbType'],
+          algorithmicReverb: Math.round(info.settings.algorithmic_reverb * 100), // Convert 0-1 to 0-100
+          repeatRangeMin: info.settings.repeat_min,
+          repeatRangeMax: info.settings.repeat_max,
+          pauseRangeMin: info.settings.pause_min,
+          pauseRangeMax: info.settings.pause_max,
+          volumeVariation: Math.round(info.settings.volume_variation * 100), // Convert 0-0.5 to 0-50
+        });
       }
+      
+      // Always update - this handles both adding sounds AND clearing when empty
+      set({ activeSounds: newActiveSounds });
     } catch (error) {
       console.warn('Failed to sync active ambients from backend:', error);
     }
@@ -384,12 +383,8 @@ export const useAmbientStore = create<AmbientState>((set, get) => ({
   },
   
   clearAll: async () => {
-    const { activeSounds } = get();
-    
-    for (const [id] of activeSounds) {
-      await invoke('stop_ambient', { id });
-    }
-    
+    // Use backend command to stop all ambient sounds
+    await invoke('stop_all_ambient');
     set({ activeSounds: new Map() });
   },
   

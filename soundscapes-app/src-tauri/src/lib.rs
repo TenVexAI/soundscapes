@@ -353,6 +353,8 @@ enum AudioCommand {
     // Soundboard commands
     PlaySoundboard { file_path: String, volume: f32 },
     StopSoundboard,
+    SetSoundboardVolume(f32),
+    SetSoundboardMuted(bool),
     SetDuckAmount(f32),
     // Ambient commands
     PlayAmbient {
@@ -363,6 +365,7 @@ enum AudioCommand {
     },
     StopAmbient(String),
     UpdateAmbientSettings { id: String, settings: AmbientSettings },
+    StopAllAmbient, // Stop all ambient sounds
     SetAmbientMasterVolume(f32),
     SetAmbientMuted(bool),
     PreloadAmbient(Vec<String>), // Preload audio files into memory cache
@@ -905,6 +908,7 @@ struct AudioController {
     soundboard_playing: Arc<Mutex<bool>>,
     scheduler_state: Arc<Mutex<SchedulerState>>,
     presets_dir: Arc<Mutex<Option<PathBuf>>>,
+    current_preset_id: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioController {
@@ -927,6 +931,7 @@ impl AudioController {
         let soundboard_playing = Arc::new(Mutex::new(false));
         let scheduler_state = Arc::new(Mutex::new(SchedulerState::default()));
         let presets_dir: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let current_preset_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
@@ -959,6 +964,7 @@ impl AudioController {
             let mut is_master_muted = false;
             let mut track_start: Option<Instant> = None;
             let mut track_duration: f64 = 0.0;
+            let mut pause_start: Option<Instant> = None;  // Track when pause started
             let mut crossfade_duration: f32 = 3.0;  // Default 3 seconds
             // Fade states: fade_out for end of current track, fade_in for start of new track
             let mut fade_out_active: bool = false;  // Currently fading out
@@ -1005,6 +1011,8 @@ impl AudioController {
             
             // Soundboard state
             let mut soundboard_sink: Option<Sink> = None;
+            let mut soundboard_volume: f32 = 1.0; // Soundboard volume (0-1)
+            let mut soundboard_muted: bool = false; // Soundboard mute state
             let mut duck_amount: f32 = 0.5; // Default 50% ducking
             let mut duck_progress: f32 = 0.0; // 0.0 = no ducking, 1.0 = fully ducked
             let mut duck_target: f32 = 0.0; // Target duck level (0.0 or 1.0)
@@ -1630,11 +1638,17 @@ impl AudioController {
                         AudioCommand::Pause => {
                             if let Some(ref sink) = current_sink {
                                 sink.pause();
+                                pause_start = Some(Instant::now());
                             }
                         }
                         AudioCommand::Resume => {
                             if let Some(ref sink) = current_sink {
                                 sink.play();
+                                // Adjust track_start to account for pause duration
+                                if let (Some(ps), Some(ts)) = (pause_start.take(), track_start) {
+                                    let pause_duration = ps.elapsed();
+                                    track_start = Some(ts + pause_duration);
+                                }
                             }
                         }
                         AudioCommand::Seek(position) => {
@@ -1697,12 +1711,26 @@ impl AudioController {
                         }
                         AudioCommand::SetMasterVolume(vol) => {
                             master_volume = vol;
+                            // Update music volume
                             if let Some(ref sink) = current_sink {
                                 let effective_vol = if is_muted || is_master_muted {
                                     0.0
                                 } else {
                                     music_volume * master_volume
                                 };
+                                sink.set_volume(effective_vol);
+                            }
+                            // Update ambient volumes
+                            for state in ambient_states.values() {
+                                let effective_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                );
+                                state.sink.set_volume(effective_vol);
+                            }
+                            // Update soundboard volume
+                            if let Some(ref sink) = soundboard_sink {
+                                let effective_vol = if soundboard_muted || is_master_muted { 0.0 } else { soundboard_volume * master_volume };
                                 sink.set_volume(effective_vol);
                             }
                         }
@@ -1719,6 +1747,7 @@ impl AudioController {
                         }
                         AudioCommand::SetMasterMuted(muted) => {
                             is_master_muted = muted;
+                            // Update music volume
                             if let Some(ref sink) = current_sink {
                                 let effective_vol = if is_muted || is_master_muted {
                                     0.0
@@ -1727,12 +1756,25 @@ impl AudioController {
                                 };
                                 sink.set_volume(effective_vol);
                             }
+                            // Update ambient volumes
+                            for state in ambient_states.values() {
+                                let effective_vol = calc_ambient_volume(
+                                    &state.settings, ambient_master_volume, master_volume,
+                                    is_ambient_muted, is_master_muted, duck_progress, duck_amount
+                                );
+                                state.sink.set_volume(effective_vol);
+                            }
+                            // Update soundboard volume
+                            if let Some(ref sink) = soundboard_sink {
+                                let effective_vol = if soundboard_muted || is_master_muted { 0.0 } else { soundboard_volume * master_volume };
+                                sink.set_volume(effective_vol);
+                            }
                         }
                         AudioCommand::SetCrossfadeDuration(duration) => {
                             crossfade_duration = duration;
                         }
                         // Soundboard commands
-                        AudioCommand::PlaySoundboard { file_path, volume } => {
+                        AudioCommand::PlaySoundboard { file_path, volume: _ } => {
                             // Stop any current soundboard sound
                             if let Some(old_sink) = soundboard_sink.take() {
                                 old_sink.stop();
@@ -1749,10 +1791,11 @@ impl AudioController {
                                         Ok(source) => {
                                             match Sink::try_new(&stream_handle) {
                                                 Ok(sink) => {
-                                                    let effective_vol = if is_master_muted {
+                                                    // Use stored soundboard volume/mute state
+                                                    let effective_vol = if soundboard_muted || is_master_muted {
                                                         0.0
                                                     } else {
-                                                        volume * master_volume
+                                                        soundboard_volume * master_volume
                                                     };
                                                     sink.set_volume(effective_vol);
                                                     sink.append(source.convert_samples::<f32>());
@@ -1777,6 +1820,22 @@ impl AudioController {
                         }
                         AudioCommand::SetDuckAmount(amount) => {
                             duck_amount = amount;
+                        }
+                        AudioCommand::SetSoundboardVolume(volume) => {
+                            soundboard_volume = volume;
+                            // Apply to currently playing soundboard
+                            if let Some(ref sink) = soundboard_sink {
+                                let effective_vol = if soundboard_muted || is_master_muted { 0.0 } else { soundboard_volume * master_volume };
+                                sink.set_volume(effective_vol);
+                            }
+                        }
+                        AudioCommand::SetSoundboardMuted(muted) => {
+                            soundboard_muted = muted;
+                            // Apply to currently playing soundboard
+                            if let Some(ref sink) = soundboard_sink {
+                                let effective_vol = if soundboard_muted || is_master_muted { 0.0 } else { soundboard_volume * master_volume };
+                                sink.set_volume(effective_vol);
+                            }
                         }
                         // Ambient sound commands with A/B crossfade
                         AudioCommand::PlayAmbient { id, file_a, file_b, settings } => {
@@ -1853,6 +1912,16 @@ impl AudioController {
                             // Start fade-out instead of immediate stop
                             if ambient_states.contains_key(&id) && !fading_out.contains_key(&id) {
                                 fading_out.insert(id, 0.0);
+                            }
+                        }
+                        AudioCommand::StopAllAmbient => {
+                            // Stop all ambient sounds with fade-out
+                            let ids: Vec<String> = ambient_states.keys().cloned().collect();
+                            for id in ids {
+                                if !fading_out.contains_key(&id) && !scheduler_fading_out.contains_key(&id) {
+                                    // Use scheduler fade for smoother transition
+                                    scheduler_fading_out.insert(id, 0.0);
+                                }
                             }
                         }
                         AudioCommand::UpdateAmbientSettings { id, settings } => {
@@ -2426,6 +2495,7 @@ impl AudioController {
             soundboard_playing,
             scheduler_state,
             presets_dir,
+            current_preset_id,
         }
     }
     
@@ -2781,6 +2851,8 @@ fn stop_scheduler_playback(state: tauri::State<Arc<AudioController>>) -> Result<
     sched.current_item_index = 0;
     sched.current_duration = 0;
     sched.time_remaining = 0;
+    // Also stop all ambient sounds
+    state.send(AudioCommand::StopAllAmbient);
     Ok(())
 }
 
@@ -3217,6 +3289,12 @@ fn stop_ambient(state: tauri::State<Arc<AudioController>>, id: String) -> Result
 }
 
 #[tauri::command]
+fn stop_all_ambient(state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
+    state.send(AudioCommand::StopAllAmbient);
+    Ok(())
+}
+
+#[tauri::command]
 fn update_ambient_settings(
     state: tauri::State<Arc<AudioController>>,
     id: String,
@@ -3258,6 +3336,18 @@ fn set_ambient_master_volume(state: tauri::State<Arc<AudioController>>, volume: 
 #[tauri::command]
 fn set_ambient_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> Result<(), String> {
     state.send(AudioCommand::SetAmbientMuted(muted));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_soundboard_volume(state: tauri::State<Arc<AudioController>>, volume: f32) -> Result<(), String> {
+    state.send(AudioCommand::SetSoundboardVolume(volume));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_soundboard_muted(state: tauri::State<Arc<AudioController>>, muted: bool) -> Result<(), String> {
+    state.send(AudioCommand::SetSoundboardMuted(muted));
     Ok(())
 }
 
@@ -3554,6 +3644,16 @@ fn delete_preset(app: tauri::AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn get_current_preset_id(state: tauri::State<Arc<AudioController>>) -> Option<String> {
+    state.current_preset_id.lock().clone()
+}
+
+#[tauri::command]
+fn set_current_preset_id(state: tauri::State<Arc<AudioController>>, id: Option<String>) {
+    *state.current_preset_id.lock() = id;
+}
+
 // Schedule Preset Commands
 fn get_schedules_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let app_data = app.path().app_data_dir()
@@ -3774,9 +3874,12 @@ pub fn run() {
             preload_ambient_sounds,
             play_ambient,
             stop_ambient,
+            stop_all_ambient,
             update_ambient_settings,
             set_ambient_master_volume,
             set_ambient_muted,
+            set_soundboard_volume,
+            set_soundboard_muted,
             play_ambient_scheduler,
             stop_ambient_scheduler,
             update_ambient_settings_scheduler,
@@ -3785,6 +3888,8 @@ pub fn run() {
             save_preset,
             load_preset,
             delete_preset,
+            get_current_preset_id,
+            set_current_preset_id,
             list_schedules,
             save_schedule,
             load_schedule,
