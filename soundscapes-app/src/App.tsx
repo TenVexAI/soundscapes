@@ -5,10 +5,14 @@ import { MainWindow } from './components/MainWindow/MainWindow';
 import { Visualizer } from './components/MainWindow/Visualizer';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAudioStore } from './stores/audioStore';
+import { usePersistentPlayback } from './hooks/usePersistentPlayback';
 
 function App() {
   const { loadSettings } = useSettingsStore();
   const { initAudio, loadVolumesFromSettings } = useAudioStore();
+
+  // Persistent playback hooks - always running regardless of which windows are open
+  usePersistentPlayback();
 
   useEffect(() => {
     const init = async () => {

@@ -212,7 +212,7 @@ pub struct MusicPlaylist {
 }
 
 // Playlist playback state (shared across windows)
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlaylistState {
     #[serde(rename = "currentPlaylistId")]
     pub current_playlist_id: Option<String>,
@@ -225,6 +225,35 @@ pub struct PlaylistState {
     pub favorites: Vec<String>,  // Track IDs that are favorited
     #[serde(rename = "interruptedIndex")]
     pub interrupted_index: Option<i32>,  // For resuming after Play Now
+}
+
+impl Default for PlaylistState {
+    fn default() -> Self {
+        Self {
+            current_playlist_id: None,
+            current_index: 0,
+            is_shuffled: false,
+            is_looping: true, // Loop enabled by default
+            favorites: Vec::new(),
+            interrupted_index: None,
+        }
+    }
+}
+
+// Scheduler playback state (shared across windows)
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SchedulerState {
+    #[serde(rename = "isPlaying")]
+    pub is_playing: bool,
+    #[serde(rename = "currentItemIndex")]
+    pub current_item_index: usize,
+    #[serde(rename = "currentDuration")]
+    pub current_duration: u32, // minutes
+    #[serde(rename = "timeRemaining")]
+    pub time_remaining: i32, // seconds
+    pub items: Vec<ScheduledItem>,
+    #[serde(rename = "currentScheduleId")]
+    pub current_schedule_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -874,6 +903,8 @@ struct AudioController {
     playlists: Arc<Mutex<HashMap<String, MusicPlaylist>>>,
     all_tracks: Arc<Mutex<Vec<PlaylistTrack>>>,
     soundboard_playing: Arc<Mutex<bool>>,
+    scheduler_state: Arc<Mutex<SchedulerState>>,
+    presets_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl AudioController {
@@ -888,12 +919,14 @@ impl AudioController {
         let playback_state = Arc::new(Mutex::new(PlaybackState::default()));
         let sample_buffer = Arc::new(FftSampleBuffer::new());
         let ambient_sample_buffer = Arc::new(AmbientSampleBuffer::new());
-        let active_ambients = Arc::new(Mutex::new(HashMap::new()));
+        let active_ambients: Arc<Mutex<HashMap<String, ActiveAmbientInfo>>> = Arc::new(Mutex::new(HashMap::new()));
         let current_track = Arc::new(Mutex::new(None::<CurrentTrackInfo>));
         let playlist_state = Arc::new(Mutex::new(PlaylistState::default()));
-        let playlists = Arc::new(Mutex::new(HashMap::new()));
-        let all_tracks = Arc::new(Mutex::new(Vec::new()));
+        let playlists: Arc<Mutex<HashMap<String, MusicPlaylist>>> = Arc::new(Mutex::new(HashMap::new()));
+        let all_tracks: Arc<Mutex<Vec<PlaylistTrack>>> = Arc::new(Mutex::new(Vec::new()));
         let soundboard_playing = Arc::new(Mutex::new(false));
+        let scheduler_state = Arc::new(Mutex::new(SchedulerState::default()));
+        let presets_dir: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         
         let progress_clone = progress.clone();
         let playback_state_clone = playback_state.clone();
@@ -902,6 +935,12 @@ impl AudioController {
         let active_ambients_clone = active_ambients.clone();
         let current_track_clone = current_track.clone();
         let soundboard_playing_clone = soundboard_playing.clone();
+        let playlist_state_clone = playlist_state.clone();
+        let playlists_clone = playlists.clone();
+        let all_tracks_clone = all_tracks.clone();
+        let scheduler_state_clone = scheduler_state.clone();
+        let presets_dir_clone = presets_dir.clone();
+        let command_tx_clone = command_tx.clone();
         
         // Spawn audio thread
         thread::spawn(move || {
@@ -971,6 +1010,14 @@ impl AudioController {
             let mut duck_target: f32 = 0.0; // Target duck level (0.0 or 1.0)
             const DUCK_FADE_SPEED: f32 = 0.15; // How fast to fade ducking per loop iteration (~300ms full fade)
             
+            // Auto-advance state for playlist
+            let mut was_playing: bool = false;
+            let mut pending_auto_advance: Option<(String, CurrentTrackInfo)> = None; // (file_path, track_info)
+            
+            // Scheduler tick counter (loop runs every 50ms, so 20 iterations = 1 second)
+            let mut scheduler_tick_counter: u32 = 0;
+            const SCHEDULER_TICKS_PER_SECOND: u32 = 20;
+            
             // Helper to calculate effective volume with variation and ducking
             fn calc_ambient_volume(
                 settings: &AmbientSettings,
@@ -996,7 +1043,185 @@ impl AudioController {
                 }
             }
             
+            // Track last loaded scheduler item to detect changes
+            let mut last_scheduler_item_index: Option<usize> = None;
+            let mut scheduler_preset_pending: Option<String> = None; // preset_id to load
+            
             loop {
+                // Handle scheduler tick (every 1 second)
+                scheduler_tick_counter += 1;
+                if scheduler_tick_counter >= SCHEDULER_TICKS_PER_SECOND {
+                    scheduler_tick_counter = 0;
+                    
+                    let mut sched = scheduler_state_clone.lock();
+                    if sched.is_playing && !sched.items.is_empty() {
+                        // Check if this is the first tick or if we advanced to a new item
+                        let current_idx = sched.current_item_index;
+                        let should_load_preset = last_scheduler_item_index != Some(current_idx);
+                        
+                        if should_load_preset {
+                            last_scheduler_item_index = Some(current_idx);
+                            let preset_id = sched.items[current_idx].preset_id.clone();
+                            scheduler_preset_pending = Some(preset_id);
+                        }
+                        
+                        sched.time_remaining -= 1;
+                        
+                        if sched.time_remaining <= 0 {
+                            // Advance to next item
+                            let next_index = (sched.current_item_index + 1) % sched.items.len();
+                            
+                            // Clone values before mutating sched
+                            let next_preset_id = sched.items[next_index].preset_id.clone();
+                            let min = sched.items[next_index].min_minutes.min(sched.items[next_index].max_minutes);
+                            let max = sched.items[next_index].min_minutes.max(sched.items[next_index].max_minutes);
+                            let duration = if min == max {
+                                min
+                            } else {
+                                min + (rand::random::<u32>() % (max - min + 1))
+                            };
+                            
+                            sched.current_item_index = next_index;
+                            sched.current_duration = duration;
+                            sched.time_remaining = (duration * 60) as i32;
+                            
+                            // Queue the next preset to load
+                            scheduler_preset_pending = Some(next_preset_id);
+                            last_scheduler_item_index = Some(next_index);
+                        }
+                    } else if !sched.is_playing {
+                        last_scheduler_item_index = None;
+                    }
+                }
+                
+                // Handle pending scheduler preset load
+                if let Some(preset_id) = scheduler_preset_pending.take() {
+                    if let Some(presets_path) = presets_dir_clone.lock().clone() {
+                        let preset_path = presets_path.join(format!("{}.soundscape", &preset_id));
+                        if preset_path.exists() {
+                            if let Ok(content) = fs::read_to_string(&preset_path) {
+                                if let Ok(preset) = serde_json::from_str::<SoundscapePreset>(&content) {
+                                    // Get current active ambient IDs
+                                    let current_ids: std::collections::HashSet<String> = {
+                                        active_ambients_clone.lock().keys().cloned().collect()
+                                    };
+                                    
+                                    // Get new preset sound IDs
+                                    let new_ids: std::collections::HashSet<String> = preset.sounds
+                                        .iter()
+                                        .filter(|s| s.enabled)
+                                        .map(|s| s.sound_id.clone())
+                                        .collect();
+                                    
+                                    // Stop sounds not in new preset (with scheduler fade)
+                                    for id in current_ids.difference(&new_ids) {
+                                        scheduler_fading_out.insert(id.clone(), 1.0);
+                                    }
+                                    
+                                    // Start or update sounds in new preset
+                                    for sound in &preset.sounds {
+                                        if !sound.enabled {
+                                            continue;
+                                        }
+                                        
+                                        let settings = AmbientSettings {
+                                            volume: sound.volume as f32 / 100.0,
+                                            pitch: sound.pitch,
+                                            pan: sound.pan as f32 / 100.0,
+                                            low_pass_freq: sound.low_pass_freq as f32,
+                                            reverb_type: "off".to_string(),
+                                            algorithmic_reverb: sound.algorithmic_reverb as f32 / 100.0,
+                                            repeat_min: sound.repeat_range_min,
+                                            repeat_max: sound.repeat_range_max,
+                                            pause_min: sound.pause_range_min,
+                                            pause_max: sound.pause_range_max,
+                                            volume_variation: sound.volume_variation as f32 / 100.0,
+                                        };
+                                        
+                                        let id = sound.sound_id.clone();
+                                        let file_a = sound.files_a.clone();
+                                        let file_b = sound.files_b.clone();
+                                        
+                                        // Check if already playing
+                                        let already_playing = active_ambients_clone.lock().contains_key(&id);
+                                        
+                                        if already_playing {
+                                            // Update settings with scheduler transition
+                                            if let Some(state) = active_ambients_clone.lock().get_mut(&id) {
+                                                state.settings = settings;
+                                            }
+                                        } else {
+                                            // Start new sound - queue as scheduler command
+                                            // We'll handle this via the command channel
+                                            let _ = command_tx_clone.send(AudioCommand::PlayAmbientScheduler {
+                                                id,
+                                                file_a,
+                                                file_b,
+                                                settings,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Handle pending auto-advance (play next track in playlist)
+                if let Some((file_path, track_info)) = pending_auto_advance.take() {
+                    // Reset fade states for new track
+                    fade_out_active = false;
+                    sample_buffer_clone.clear();
+                    *current_track_clone.lock() = Some(track_info);
+                    
+                    match File::open(&file_path) {
+                        Ok(file) => {
+                            let reader = BufReader::new(file);
+                            match Decoder::new(reader) {
+                                Ok(source) => {
+                                    let duration = source.total_duration()
+                                        .map(|d| d.as_secs_f64())
+                                        .unwrap_or(0.0);
+                                    
+                                    let source_f32 = source.convert_samples::<f32>();
+                                    let analyzing_source = AnalyzingSource::new(
+                                        source_f32,
+                                        sample_buffer_clone.clone()
+                                    );
+                                    
+                                    match Sink::try_new(&stream_handle) {
+                                        Ok(sink) => {
+                                            let start_vol = if crossfade_duration > 0.0 {
+                                                fade_in_progress = Some((Instant::now(), crossfade_duration));
+                                                0.0
+                                            } else if is_muted || is_master_muted {
+                                                0.0
+                                            } else {
+                                                music_volume * master_volume
+                                            };
+                                            sink.set_volume(start_vol);
+                                            sink.append(analyzing_source);
+                                            
+                                            track_start = Some(Instant::now());
+                                            track_duration = duration;
+                                            current_sink = Some(sink);
+                                            
+                                            let mut prog = progress_clone.lock();
+                                            prog.current_time = 0.0;
+                                            prog.duration = duration;
+                                            prog.is_playing = true;
+                                            prog.is_finished = false;
+                                        }
+                                        Err(e) => eprintln!("Auto-advance: Failed to create sink: {}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!("Auto-advance: Failed to decode audio: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("Auto-advance: Failed to open file {}: {}", file_path, e),
+                    }
+                }
+                
                 // Check if soundboard finished playing
                 if let Some(ref sink) = soundboard_sink {
                     if sink.empty() {
@@ -1086,7 +1311,7 @@ impl AudioController {
                     }
                 }
                 
-                // Update progress
+                // Update progress and handle auto-advance
                 if let Some(ref sink) = current_sink {
                     let is_empty = sink.empty();
                     let is_paused = sink.is_paused();
@@ -1100,6 +1325,77 @@ impl AudioController {
                             prog.current_time = start.elapsed().as_secs_f64();
                         }
                     }
+                    
+                    // Auto-advance: if we were playing and track just finished, queue next track
+                    if was_playing && is_empty && pending_auto_advance.is_none() {
+                        // Get playlist state and determine next track
+                        let ps = playlist_state_clone.lock().clone();
+                        if let Some(ref playlist_id) = ps.current_playlist_id {
+                            let all_tracks = all_tracks_clone.lock();
+                            let playlists = playlists_clone.lock();
+                            
+                            // Get tracks for current playlist
+                            let tracks: Option<Vec<PlaylistTrack>> = if playlist_id.starts_with("album-") {
+                                // Album playlist - filter all_tracks by album name
+                                let album_name = playlist_id.strip_prefix("album-").unwrap_or("");
+                                let album_tracks: Vec<PlaylistTrack> = all_tracks.iter()
+                                    .filter(|t| t.album == album_name)
+                                    .cloned()
+                                    .collect();
+                                if !album_tracks.is_empty() { Some(album_tracks) } else { None }
+                            } else if playlist_id == "all-music" {
+                                Some(all_tracks.clone())
+                            } else if playlist_id == "favorites" {
+                                let fav_tracks: Vec<PlaylistTrack> = all_tracks.iter()
+                                    .filter(|t| ps.favorites.contains(&t.id))
+                                    .cloned()
+                                    .collect();
+                                if !fav_tracks.is_empty() { Some(fav_tracks) } else { None }
+                            } else {
+                                // Custom playlist
+                                playlists.get(playlist_id).map(|p| p.tracks.clone())
+                            };
+                            
+                            if let Some(tracks) = tracks {
+                                if !tracks.is_empty() {
+                                    // Calculate next index
+                                    let current_idx = ps.current_index as usize;
+                                    let next_idx = if ps.is_shuffled {
+                                        // Random next track
+                                        rand::random::<usize>() % tracks.len()
+                                    } else {
+                                        // Sequential
+                                        let next = current_idx + 1;
+                                        if next >= tracks.len() {
+                                            if ps.is_looping { 0 } else { tracks.len() } // Stop if not looping
+                                        } else {
+                                            next
+                                        }
+                                    };
+                                    
+                                    if next_idx < tracks.len() {
+                                        let next_track = &tracks[next_idx];
+                                        let file_path = format!("{}/{}", next_track.album_path, next_track.file);
+                                        let track_info = CurrentTrackInfo {
+                                            id: next_track.id.clone(),
+                                            title: next_track.title.clone(),
+                                            artist: next_track.artist.clone(),
+                                            album: next_track.album.clone(),
+                                            file_path: file_path.clone(),
+                                        };
+                                        
+                                        // Update playlist state
+                                        drop(all_tracks);
+                                        drop(playlists);
+                                        playlist_state_clone.lock().current_index = next_idx as i32;
+                                        
+                                        pending_auto_advance = Some((file_path, track_info));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    was_playing = !is_empty && !is_paused;
                 }
                 
                 // Update playback state for visualization with FFT
@@ -2051,7 +2347,13 @@ impl AudioController {
             playlists,
             all_tracks,
             soundboard_playing,
+            scheduler_state,
+            presets_dir,
         }
+    }
+    
+    fn set_presets_dir(&self, path: PathBuf) {
+        *self.presets_dir.lock() = Some(path);
     }
     
     fn send(&self, cmd: AudioCommand) {
@@ -2327,9 +2629,10 @@ fn update_soundboard_sound(
 
 // Audio Commands - using thread-safe AudioController
 #[tauri::command]
-fn init_audio(state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
-    // AudioController is already initialized in run()
-    let _ = state.inner();
+fn init_audio(app: tauri::AppHandle, state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
+    // Set the presets directory for the audio thread to use
+    let presets_dir = get_presets_dir(&app)?;
+    state.set_presets_dir(presets_dir);
     Ok(())
 }
 
@@ -2356,6 +2659,52 @@ fn play_music(
 #[tauri::command]
 fn get_current_track(state: tauri::State<Arc<AudioController>>) -> Result<Option<CurrentTrackInfo>, String> {
     Ok(state.get_current_track())
+}
+
+// Scheduler management commands
+#[tauri::command]
+fn get_scheduler_state(state: tauri::State<Arc<AudioController>>) -> Result<SchedulerState, String> {
+    Ok(state.scheduler_state.lock().clone())
+}
+
+#[tauri::command]
+fn start_scheduler_playback(
+    state: tauri::State<Arc<AudioController>>,
+    items: Vec<ScheduledItem>,
+    schedule_id: Option<String>,
+) -> Result<(), String> {
+    let mut sched = state.scheduler_state.lock();
+    if items.is_empty() {
+        return Err("No items to schedule".to_string());
+    }
+    
+    let first_item = &items[0];
+    let min = first_item.min_minutes.min(first_item.max_minutes);
+    let max = first_item.min_minutes.max(first_item.max_minutes);
+    let duration = if min == max {
+        min
+    } else {
+        min + (rand::random::<u32>() % (max - min + 1))
+    };
+    
+    sched.items = items;
+    sched.current_schedule_id = schedule_id;
+    sched.is_playing = true;
+    sched.current_item_index = 0;
+    sched.current_duration = duration;
+    sched.time_remaining = (duration * 60) as i32;
+    
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_scheduler_playback(state: tauri::State<Arc<AudioController>>) -> Result<(), String> {
+    let mut sched = state.scheduler_state.lock();
+    sched.is_playing = false;
+    sched.current_item_index = 0;
+    sched.current_duration = 0;
+    sched.time_remaining = 0;
+    Ok(())
 }
 
 // Playlist management commands
@@ -2405,6 +2754,132 @@ fn set_current_playlist(state: tauri::State<Arc<AudioController>>, playlist_id: 
 fn set_playlist_index(state: tauri::State<Arc<AudioController>>, index: i32) -> Result<(), String> {
     state.playlist_state.lock().current_index = index;
     Ok(())
+}
+
+#[tauri::command]
+fn play_next_track(state: tauri::State<Arc<AudioController>>) -> Result<bool, String> {
+    // Get current playlist state
+    let ps = state.playlist_state.lock().clone();
+    let all_tracks = state.all_tracks.lock().clone();
+    let playlists = state.playlists.lock().clone();
+    
+    // Determine which tracks to use
+    let tracks: Vec<PlaylistTrack> = if let Some(ref playlist_id) = ps.current_playlist_id {
+        if playlist_id == "all-music" {
+            all_tracks.clone()
+        } else if playlist_id == "favorites" {
+            all_tracks.iter().filter(|t| ps.favorites.contains(&t.id)).cloned().collect()
+        } else if playlist_id.starts_with("album-") {
+            // Filter tracks by album name
+            let album_name = playlist_id.strip_prefix("album-").unwrap_or("");
+            all_tracks.iter().filter(|t| t.album == album_name).cloned().collect()
+        } else if let Some(playlist) = playlists.get(playlist_id) {
+            playlist.tracks.clone()
+        } else {
+            // Unknown playlist, return empty
+            Vec::new()
+        }
+    } else {
+        return Ok(false); // No playlist selected
+    };
+    
+    if tracks.is_empty() {
+        return Ok(false);
+    }
+    
+    // Calculate next index
+    let next_index: i32 = if ps.is_shuffled {
+        ((rand::random::<usize>()) % tracks.len()) as i32
+    } else {
+        let next = ps.current_index + 1;
+        if next >= tracks.len() as i32 {
+            if ps.is_looping {
+                0
+            } else {
+                return Ok(false); // Playlist finished, not looping
+            }
+        } else {
+            next
+        }
+    };
+    
+    // Update state
+    {
+        let mut ps_lock = state.playlist_state.lock();
+        ps_lock.current_index = next_index;
+    }
+    
+    // Get the track and play it
+    let track = &tracks[next_index as usize];
+    let file_path = format!("{}/{}", track.album_path, track.file);
+    let track_info = CurrentTrackInfo {
+        id: track.id.clone(),
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        file_path: file_path.clone(),
+    };
+    
+    state.send(AudioCommand::Play { file_path, track_info });
+    Ok(true)
+}
+
+#[tauri::command]
+fn play_previous_track(state: tauri::State<Arc<AudioController>>) -> Result<bool, String> {
+    // Get current playlist state
+    let ps = state.playlist_state.lock().clone();
+    let all_tracks = state.all_tracks.lock().clone();
+    let playlists = state.playlists.lock().clone();
+    
+    // Determine which tracks to use
+    let tracks: Vec<PlaylistTrack> = if let Some(ref playlist_id) = ps.current_playlist_id {
+        if playlist_id == "all-music" {
+            all_tracks.clone()
+        } else if playlist_id == "favorites" {
+            all_tracks.iter().filter(|t| ps.favorites.contains(&t.id)).cloned().collect()
+        } else if playlist_id.starts_with("album-") {
+            // Filter tracks by album name
+            let album_name = playlist_id.strip_prefix("album-").unwrap_or("");
+            all_tracks.iter().filter(|t| t.album == album_name).cloned().collect()
+        } else if let Some(playlist) = playlists.get(playlist_id) {
+            playlist.tracks.clone()
+        } else {
+            Vec::new()
+        }
+    } else {
+        return Ok(false);
+    };
+    
+    if tracks.is_empty() {
+        return Ok(false);
+    }
+    
+    // Calculate previous index
+    let prev_index = if ps.current_index <= 0 {
+        (tracks.len() - 1) as i32
+    } else {
+        ps.current_index - 1
+    };
+    
+    // Update state
+    {
+        let mut ps_lock = state.playlist_state.lock();
+        ps_lock.current_index = prev_index;
+    }
+    
+    // Get the track and play it
+    let track = &tracks[prev_index as usize];
+    let file_path = format!("{}/{}", track.album_path, track.file);
+    let track_info = CurrentTrackInfo {
+        id: track.id.clone(),
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        file_path: file_path.clone(),
+    };
+    
+    state.send(AudioCommand::Play { file_path, track_info });
+    Ok(true)
 }
 
 #[tauri::command]
@@ -3209,6 +3684,8 @@ pub fn run() {
             set_playlist_loop,
             set_current_playlist,
             set_playlist_index,
+            play_next_track,
+            play_previous_track,
             toggle_favorite,
             get_playlists,
             save_playlist,
@@ -3234,7 +3711,10 @@ pub fn run() {
             list_schedules,
             save_schedule,
             load_schedule,
-            delete_schedule
+            delete_schedule,
+            get_scheduler_state,
+            start_scheduler_playback,
+            stop_scheduler_playback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

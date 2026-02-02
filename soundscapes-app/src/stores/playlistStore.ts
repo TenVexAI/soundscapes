@@ -114,11 +114,8 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
       const backendState = await invoke<BackendPlaylistState>('get_playlist_state');
       const customPlaylists = await invoke<MusicPlaylist[]>('get_playlists');
       
-      // Set loop to true by default on startup
-      if (!backendState.isLooping) {
-        await invoke('set_playlist_loop', { looping: true });
-        backendState.isLooping = true;
-      }
+      // Note: Loop defaults are now handled by backend initialization
+      // Don't override user's loop setting when reloading albums
       
       // Build auto playlists
       const allMusicPlaylist: MusicPlaylist = {
@@ -195,59 +192,44 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
   },
   
   playTrackFromPlaylist: async (playlistId: string, index: number) => {
-    const { playlists } = get();
-    const playlist = playlists.find(p => p.id === playlistId);
-    if (!playlist || index < 0 || index >= playlist.tracks.length) return;
+    const { playlists, albums } = get();
+    
+    // Get tracks from playlist or album
+    let tracks: PlaylistTrack[] = [];
+    if (playlistId.startsWith('album-')) {
+      const albumName = playlistId.replace('album-', '');
+      const album = albums.find(a => a.name === albumName);
+      if (album) {
+        tracks = album.tracks.map(t => ({
+          id: t.id,
+          file: t.file,
+          title: t.title,
+          artist: t.artist,
+          album: album.name,
+          albumPath: album.path,
+        }));
+      }
+    } else {
+      const playlist = playlists.find(p => p.id === playlistId);
+      if (playlist) {
+        tracks = playlist.tracks;
+      }
+    }
+    
+    if (tracks.length === 0 || index < 0 || index >= tracks.length) return;
     
     await invoke('set_current_playlist', { playlistId });
     await invoke('set_playlist_index', { index });
     
     set({ currentPlaylistId: playlistId, currentIndex: index, interruptedIndex: null });
     
-    await get().playTrack(playlist.tracks[index]);
+    await get().playTrack(tracks[index]);
   },
   
   playNext: async () => {
-    const { playNextQueue, currentPlaylistId, currentIndex, isShuffled, isLooping, interruptedIndex, playlists, albums } = get();
+    const { playNextQueue } = get();
     
-    // Helper to get current playlist or album
-    const getCurrentPlaylistOrAlbum = (): { tracks: PlaylistTrack[] } | null => {
-      if (!currentPlaylistId) return null;
-      
-      if (currentPlaylistId.startsWith('album-')) {
-        const albumName = currentPlaylistId.replace('album-', '');
-        const album = albums.find(a => a.name === albumName);
-        if (album) {
-          return {
-            tracks: album.tracks.map(t => ({
-              id: t.id,
-              file: t.file,
-              title: t.title,
-              artist: t.artist,
-              album: album.name,
-              albumPath: album.path,
-            })),
-          };
-        }
-        return null;
-      }
-      
-      return playlists.find(p => p.id === currentPlaylistId) || null;
-    };
-    
-    // Check if we need to resume from interrupted position
-    if (interruptedIndex !== null) {
-      const playlist = getCurrentPlaylistOrAlbum();
-      if (playlist) {
-        const resumeIndex = (interruptedIndex + 1) % playlist.tracks.length;
-        await invoke('set_playlist_index', { index: resumeIndex });
-        set({ currentIndex: resumeIndex, interruptedIndex: null });
-        await get().playTrack(playlist.tracks[resumeIndex]);
-        return;
-      }
-    }
-    
-    // Check play next queue first
+    // Check play next queue first (local queue for "Play Next" feature)
     if (playNextQueue.length > 0) {
       const nextTrack = playNextQueue[0];
       set({ playNextQueue: playNextQueue.slice(1) });
@@ -255,66 +237,25 @@ export const usePlaylistStore = create<PlaylistState>((set, get) => ({
       return;
     }
     
-    // Continue with current playlist or album
-    const playlist = getCurrentPlaylistOrAlbum();
-    if (!playlist || playlist.tracks.length === 0) return;
-    
-    let nextIndex: number;
-    if (isShuffled) {
-      nextIndex = Math.floor(Math.random() * playlist.tracks.length);
-    } else {
-      nextIndex = currentIndex + 1;
-      if (nextIndex >= playlist.tracks.length) {
-        if (isLooping) {
-          nextIndex = 0;
-        } else {
-          // Playlist finished
-          return;
-        }
-      }
+    // Use backend command - it has all the playlist/track data
+    try {
+      await invoke<boolean>('play_next_track');
+      // Sync state after backend plays next track
+      await get().syncWithBackend();
+    } catch (error) {
+      console.error('Error playing next track:', error);
     }
-    
-    await invoke('set_playlist_index', { index: nextIndex });
-    set({ currentIndex: nextIndex });
-    await get().playTrack(playlist.tracks[nextIndex]);
   },
   
   playPrevious: async () => {
-    const { currentPlaylistId, currentIndex, playlists, albums } = get();
-    
-    // Helper to get current playlist or album
-    const getCurrentPlaylistOrAlbum = (): { tracks: PlaylistTrack[] } | null => {
-      if (!currentPlaylistId) return null;
-      
-      if (currentPlaylistId.startsWith('album-')) {
-        const albumName = currentPlaylistId.replace('album-', '');
-        const album = albums.find(a => a.name === albumName);
-        if (album) {
-          return {
-            tracks: album.tracks.map(t => ({
-              id: t.id,
-              file: t.file,
-              title: t.title,
-              artist: t.artist,
-              album: album.name,
-              albumPath: album.path,
-            })),
-          };
-        }
-        return null;
-      }
-      
-      return playlists.find(p => p.id === currentPlaylistId) || null;
-    };
-    
-    const playlist = getCurrentPlaylistOrAlbum();
-    if (!playlist || playlist.tracks.length === 0) return;
-    
-    const prevIndex = currentIndex <= 0 ? playlist.tracks.length - 1 : currentIndex - 1;
-    
-    await invoke('set_playlist_index', { index: prevIndex });
-    set({ currentIndex: prevIndex });
-    await get().playTrack(playlist.tracks[prevIndex]);
+    // Use backend command - it has all the playlist/track data
+    try {
+      await invoke<boolean>('play_previous_track');
+      // Sync state after backend plays previous track
+      await get().syncWithBackend();
+    } catch (error) {
+      console.error('Error playing previous track:', error);
+    }
   },
   
   setCurrentPlaylist: async (playlistId: string | null) => {

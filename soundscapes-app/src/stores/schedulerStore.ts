@@ -12,7 +12,7 @@ interface SchedulerState {
   editingItems: ScheduledItem[];
   hasUnsavedChanges: boolean;
   
-  // Playback state
+  // Playback state (synced from backend)
   isPlaying: boolean;
   currentItemIndex: number;
   currentDuration: number; // Random duration chosen for current item
@@ -32,23 +32,19 @@ interface SchedulerState {
   clearItems: () => void;
   setCurrentScheduleId: (id: string | null) => void;
   
-  // Actions - Playback
-  startSchedule: () => void;
-  stopSchedule: () => void;
+  // Actions - Playback (now backed by Rust backend)
+  startSchedule: () => Promise<void>;
+  stopSchedule: () => Promise<void>;
+  syncWithBackend: () => Promise<void>;
+  
+  // Legacy (kept for compatibility but no longer used)
   advanceToNext: () => void;
-  tick: () => void; // Called every second to update timeRemaining
+  tick: () => void;
 }
 
 // Generate unique ID
 function generateId(): string {
   return `item-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-}
-
-// Get random duration between min and max
-function getRandomDuration(minMinutes: number, maxMinutes: number): number {
-  const min = Math.min(minMinutes, maxMinutes);
-  const max = Math.max(minMinutes, maxMinutes);
-  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 export const useSchedulerStore = create<SchedulerState>((set, get) => ({
@@ -183,55 +179,73 @@ export const useSchedulerStore = create<SchedulerState>((set, get) => ({
     set({ currentScheduleId: id });
   },
   
-  startSchedule: () => {
-    const { editingItems } = get();
+  startSchedule: async () => {
+    const { editingItems, currentScheduleId } = get();
     if (editingItems.length === 0) return;
     
-    const firstItem = editingItems[0];
-    const duration = getRandomDuration(firstItem.minMinutes, firstItem.maxMinutes);
-    
-    set({
-      isPlaying: true,
-      currentItemIndex: 0,
-      currentDuration: duration,
-      timeRemaining: duration * 60, // Convert to seconds
-    });
+    try {
+      // Start scheduler in backend
+      await invoke('start_scheduler_playback', {
+        items: editingItems,
+        scheduleId: currentScheduleId,
+      });
+      
+      // Sync state from backend
+      await get().syncWithBackend();
+    } catch (error) {
+      console.error('Error starting scheduler:', error);
+    }
   },
   
-  stopSchedule: () => {
-    set({
-      isPlaying: false,
-      currentItemIndex: 0,
-      currentDuration: 0,
-      timeRemaining: 0,
-    });
+  stopSchedule: async () => {
+    try {
+      await invoke('stop_scheduler_playback');
+      
+      set({
+        isPlaying: false,
+        currentItemIndex: 0,
+        currentDuration: 0,
+        timeRemaining: 0,
+      });
+    } catch (error) {
+      console.error('Error stopping scheduler:', error);
+    }
   },
   
+  syncWithBackend: async () => {
+    try {
+      const backendState = await invoke<{
+        isPlaying: boolean;
+        currentItemIndex: number;
+        currentDuration: number;
+        timeRemaining: number;
+        items: ScheduledItem[];
+        currentScheduleId: string | null;
+      }>('get_scheduler_state');
+      
+      set({
+        isPlaying: backendState.isPlaying,
+        currentItemIndex: backendState.currentItemIndex,
+        currentDuration: backendState.currentDuration,
+        timeRemaining: backendState.timeRemaining,
+        // Only update editingItems if backend has items and we don't have local changes
+        ...(backendState.items.length > 0 && !get().hasUnsavedChanges ? {
+          editingItems: backendState.items,
+          currentScheduleId: backendState.currentScheduleId,
+        } : {}),
+      });
+    } catch (error) {
+      console.error('Error syncing with backend:', error);
+    }
+  },
+  
+  // Legacy functions - kept for compatibility but scheduler now runs in backend
   advanceToNext: () => {
-    const { editingItems, currentItemIndex } = get();
-    if (editingItems.length === 0) return;
-    
-    // Loop back to start if at end
-    const nextIndex = (currentItemIndex + 1) % editingItems.length;
-    const nextItem = editingItems[nextIndex];
-    const duration = getRandomDuration(nextItem.minMinutes, nextItem.maxMinutes);
-    
-    set({
-      currentItemIndex: nextIndex,
-      currentDuration: duration,
-      timeRemaining: duration * 60,
-    });
+    // No-op - backend handles this now
   },
   
   tick: () => {
-    const { isPlaying, timeRemaining } = get();
-    if (!isPlaying) return;
-    
-    if (timeRemaining <= 0) {
-      // Time's up, advance to next
-      get().advanceToNext();
-    } else {
-      set({ timeRemaining: timeRemaining - 1 });
-    }
+    // No-op - backend handles this now
+    // Frontend should poll syncWithBackend instead
   },
 }));

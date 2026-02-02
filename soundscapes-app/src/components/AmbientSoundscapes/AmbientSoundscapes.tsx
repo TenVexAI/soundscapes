@@ -344,7 +344,7 @@ export const AmbientSoundscapes: React.FC = () => {
     setCurrentPresetId,
   } = usePresetStore();
 
-  const { stopSchedule, clearItems: clearSchedulerItems } = useSchedulerStore();
+  const { stopSchedule, clearItems: clearSchedulerItems, isPlaying: isSchedulePlaying, syncWithBackend: syncSchedulerWithBackend } = useSchedulerStore();
 
   const [showSaveNewDialog, setShowSaveNewDialog] = useState(false);
   const [presetName, setPresetName] = useState('');
@@ -382,6 +382,26 @@ export const AmbientSoundscapes: React.FC = () => {
       setShowScheduler(!showScheduler);
     }
   }, [showScheduler]);
+
+  // Auto-open scheduler panel if a schedule is already playing when this window opens
+  useEffect(() => {
+    const checkAndOpenScheduler = async () => {
+      // First sync with backend to get current scheduler state
+      await syncSchedulerWithBackend();
+      // The state will update and trigger a re-render if scheduler is playing
+    };
+    checkAndOpenScheduler();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Watch for scheduler playing state changes and open panel if needed
+  const hasAutoOpenedRef = useRef(false);
+  useEffect(() => {
+    if (isSchedulePlaying && !showScheduler && !hasAutoOpenedRef.current) {
+      hasAutoOpenedRef.current = true;
+      toggleScheduler();
+    }
+  }, [isSchedulePlaying, showScheduler, toggleScheduler]);
 
   // Toggle a single sound's expanded state
   const toggleSoundExpanded = (soundId: string) => {

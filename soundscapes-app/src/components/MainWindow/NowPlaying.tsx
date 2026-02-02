@@ -71,8 +71,8 @@ export const NowPlaying: React.FC = () => {
 
   const playNext = async () => {
     try {
-      // Skip to next track by stopping current and letting playlist auto-advance
-      await invoke('stop_music');
+      // Call backend to play next track in playlist
+      await invoke('play_next_track');
     } catch (err) {
       console.error('Error skipping track:', err);
     }
