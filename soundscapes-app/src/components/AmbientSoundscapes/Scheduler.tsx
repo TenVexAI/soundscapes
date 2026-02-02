@@ -159,7 +159,7 @@ interface SchedulerProps {
   onPrepareFadeOut: (nextPresetId: string) => Promise<void>;
 }
 
-export const Scheduler: React.FC<SchedulerProps> = ({ onLoadPreset, onClearAmbient, onPrepareFadeOut }) => {
+export const Scheduler: React.FC<SchedulerProps> = ({ onLoadPreset: _onLoadPreset, onClearAmbient, onPrepareFadeOut }) => {
   const {
     schedules,
     currentScheduleId,
@@ -227,22 +227,9 @@ export const Scheduler: React.FC<SchedulerProps> = ({ onLoadPreset, onClearAmbie
     }
   }, [isPlaying, timeRemaining, currentItemIndex, editingItems, onPrepareFadeOut]);
 
-  // Load preset when current item changes during playback
-  useEffect(() => {
-    if (!isPlaying || editingItems.length === 0) return;
-    
-    // Check if we already loaded this preset
-    if (lastLoadedRef.current?.index === currentItemIndex && lastLoadedRef.current?.playing === isPlaying) {
-      return;
-    }
-    
-    const currentItem = editingItems[currentItemIndex];
-    if (currentItem) {
-      lastLoadedRef.current = { index: currentItemIndex, playing: isPlaying };
-      // Use smart transition - onLoadPreset handles starting new sounds and updating settings
-      onLoadPreset(currentItem.presetId);
-    }
-  }, [isPlaying, currentItemIndex, editingItems, onLoadPreset]);
+  // Note: Preset loading is now handled by the Rust backend.
+  // The backend loads presets automatically when the scheduler advances.
+  // This ensures presets switch even when this window is closed.
   
   // Reset refs when playback stops
   useEffect(() => {

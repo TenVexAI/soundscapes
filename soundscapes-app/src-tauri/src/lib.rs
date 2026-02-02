@@ -1062,13 +1062,20 @@ impl AudioController {
                         if should_load_preset {
                             last_scheduler_item_index = Some(current_idx);
                             let preset_id = sched.items[current_idx].preset_id.clone();
+                            println!("[Scheduler] Queued preset load: {}", preset_id);
                             scheduler_preset_pending = Some(preset_id);
                         }
                         
                         sched.time_remaining -= 1;
+                        // Log every 10 seconds to avoid spam
+                        if sched.time_remaining % 10 == 0 {
+                            println!("[Scheduler] Tick: item {}/{}, time_remaining={}", 
+                                current_idx, sched.items.len(), sched.time_remaining);
+                        }
                         
                         if sched.time_remaining <= 0 {
                             // Advance to next item
+                            println!("[Scheduler] Time expired, advancing to next item");
                             let next_index = (sched.current_item_index + 1) % sched.items.len();
                             
                             // Clone values before mutating sched
@@ -1096,11 +1103,19 @@ impl AudioController {
                 
                 // Handle pending scheduler preset load
                 if let Some(preset_id) = scheduler_preset_pending.take() {
-                    if let Some(presets_path) = presets_dir_clone.lock().clone() {
+                    println!("[Scheduler] Loading preset: {}", preset_id);
+                    let presets_path_opt = presets_dir_clone.lock().clone();
+                    if presets_path_opt.is_none() {
+                        println!("[Scheduler] ERROR: presets_dir is None!");
+                    }
+                    if let Some(presets_path) = presets_path_opt {
                         let preset_path = presets_path.join(format!("{}.soundscape", &preset_id));
+                        println!("[Scheduler] Preset path: {:?}, exists: {}", preset_path, preset_path.exists());
                         if preset_path.exists() {
                             if let Ok(content) = fs::read_to_string(&preset_path) {
-                                if let Ok(preset) = serde_json::from_str::<SoundscapePreset>(&content) {
+                                match serde_json::from_str::<SoundscapePreset>(&content) {
+                                    Ok(preset) => {
+                                        println!("[Scheduler] Loaded preset with {} sounds", preset.sounds.len());
                                     // Get current active ambient IDs
                                     let current_ids: std::collections::HashSet<String> = {
                                         active_ambients_clone.lock().keys().cloned().collect()
@@ -1115,7 +1130,8 @@ impl AudioController {
                                     
                                     // Stop sounds not in new preset (with scheduler fade)
                                     for id in current_ids.difference(&new_ids) {
-                                        scheduler_fading_out.insert(id.clone(), 1.0);
+                                        println!("[Scheduler] Fading out removed sound: {}", id);
+                                        scheduler_fading_out.insert(id.clone(), 0.0);
                                     }
                                     
                                     // Start or update sounds in new preset
@@ -1124,7 +1140,7 @@ impl AudioController {
                                             continue;
                                         }
                                         
-                                        let settings = AmbientSettings {
+                                        let new_settings = AmbientSettings {
                                             volume: sound.volume as f32 / 100.0,
                                             pitch: sound.pitch,
                                             pan: sound.pan as f32 / 100.0,
@@ -1139,29 +1155,78 @@ impl AudioController {
                                         };
                                         
                                         let id = sound.sound_id.clone();
-                                        let file_a = sound.files_a.clone();
-                                        let file_b = sound.files_b.clone();
-                                        
-                                        // Check if already playing
-                                        let already_playing = active_ambients_clone.lock().contains_key(&id);
-                                        
-                                        if already_playing {
-                                            // Update settings with scheduler transition
-                                            if let Some(state) = active_ambients_clone.lock().get_mut(&id) {
-                                                state.settings = settings;
-                                            }
+                                        // Construct full path from category_path + filename
+                                        let file_a = if sound.files_a.is_empty() {
+                                            String::new()
                                         } else {
-                                            // Start new sound - queue as scheduler command
-                                            // We'll handle this via the command channel
+                                            let base_path = std::path::Path::new(&sound.category_path);
+                                            base_path.join(&sound.files_a).to_string_lossy().to_string()
+                                        };
+                                        let file_b = if sound.files_b.is_empty() {
+                                            String::new()
+                                        } else {
+                                            let base_path = std::path::Path::new(&sound.category_path);
+                                            base_path.join(&sound.files_b).to_string_lossy().to_string()
+                                        };
+                                        
+                                        // Check if already playing and if settings changed
+                                        let (already_playing, settings_changed) = {
+                                            let active = active_ambients_clone.lock();
+                                            if let Some(info) = active.get(&id) {
+                                                // Check if audio-affecting settings changed (pitch, pan, low_pass, reverb)
+                                                let old = &info.settings;
+                                                let changed = (old.pitch - new_settings.pitch).abs() > 0.001
+                                                    || (old.pan - new_settings.pan).abs() > 0.001
+                                                    || (old.low_pass_freq - new_settings.low_pass_freq).abs() > 1.0
+                                                    || (old.algorithmic_reverb - new_settings.algorithmic_reverb).abs() > 0.001;
+                                                (true, changed)
+                                            } else {
+                                                (false, false)
+                                            }
+                                        };
+                                        
+                                        if already_playing && settings_changed {
+                                            // Settings changed - immediately stop old and start new with fade-in
+                                            println!("[Scheduler] Settings changed for {}, restarting with new settings", id);
+                                            // Immediately stop the old sound (don't use fade-out queue since we'll reuse the ID)
+                                            if let Some(state) = ambient_states.remove(&id) {
+                                                state.sink.stop();
+                                            }
+                                            active_ambients_clone.lock().remove(&id);
+                                            // Remove from fade-out queue in case it's there
+                                            scheduler_fading_out.remove(&id);
+                                            // Queue the new sound to start with fade-in
                                             let _ = command_tx_clone.send(AudioCommand::PlayAmbientScheduler {
                                                 id,
                                                 file_a,
                                                 file_b,
-                                                settings,
+                                                settings: new_settings,
+                                            });
+                                        } else if already_playing {
+                                            // Same settings - just update volume-related settings
+                                            println!("[Scheduler] Keeping sound {} (same settings)", id);
+                                            if let Some(state) = active_ambients_clone.lock().get_mut(&id) {
+                                                state.settings.volume = new_settings.volume;
+                                                state.settings.volume_variation = new_settings.volume_variation;
+                                            }
+                                        } else {
+                                            // New sound - start it
+                                            println!("[Scheduler] Starting new sound: {}", id);
+                                            let _ = command_tx_clone.send(AudioCommand::PlayAmbientScheduler {
+                                                id,
+                                                file_a,
+                                                file_b,
+                                                settings: new_settings,
                                             });
                                         }
                                     }
+                                    }
+                                    Err(e) => {
+                                        println!("[Scheduler] ERROR parsing preset: {}", e);
+                                    }
                                 }
+                            } else {
+                                println!("[Scheduler] ERROR reading preset file");
                             }
                         }
                     }
@@ -1893,6 +1958,7 @@ impl AudioController {
                         }
                         // Scheduler-specific commands with 2000ms fade times
                         AudioCommand::PlayAmbientScheduler { id, file_a, file_b, settings } => {
+                            println!("[Scheduler] PlayAmbientScheduler: id={}, file_a={}", id, file_a);
                             // Stop existing ambient sound with this ID if any (with scheduler fade)
                             if ambient_states.contains_key(&id) && !scheduler_fading_out.contains_key(&id) {
                                 scheduler_fading_out.insert(id.clone(), 0.0);
@@ -1902,8 +1968,10 @@ impl AudioController {
                             match Sink::try_new(&stream_handle) {
                                 Ok(sink) => {
                                     let bytes = if let Some(cached_bytes) = audio_cache.get(&file_a) {
+                                        println!("[Scheduler] Using cached audio for {}", id);
                                         Some(cached_bytes.clone())
                                     } else {
+                                        println!("[Scheduler] Loading audio file: {}", file_a);
                                         File::open(&file_a).ok().and_then(|mut f| {
                                             let mut bytes = Vec::new();
                                             f.read_to_end(&mut bytes).ok().map(|_| bytes)
@@ -1911,6 +1979,7 @@ impl AudioController {
                                     };
                                     
                                     if let Some(bytes) = bytes {
+                                        println!("[Scheduler] Audio loaded, {} bytes", bytes.len());
                                     if let Ok(source) = Decoder::new(Cursor::new(bytes)) {
                                         let sample_rate = source.sample_rate();
                                         let source = source.speed(settings.pitch).convert_samples::<f32>();
@@ -2148,7 +2217,15 @@ impl AudioController {
                                     &state.settings, ambient_master_volume, master_volume,
                                     is_ambient_muted, is_master_muted, duck_progress, duck_amount
                                 );
-                                state.sink.set_volume(target_vol * fade_multiplier);
+                                let final_vol = target_vol * fade_multiplier;
+                                state.sink.set_volume(final_vol);
+                                // Log first fade-in step only
+                                if *progress < 0.1 {
+                                    println!("[Scheduler] Fade-in {}: progress={:.2}, target_vol={:.3}, final_vol={:.3}, ambient_master={:.2}, master={:.2}", 
+                                        id, progress, target_vol, final_vol, ambient_master_volume, master_volume);
+                                }
+                            } else {
+                                println!("[Scheduler] WARNING: Fade-in {} not found in ambient_states!", id);
                             }
                             if *progress >= 1.0 {
                                 completed_scheduler_fade_ins.push(id.clone());
